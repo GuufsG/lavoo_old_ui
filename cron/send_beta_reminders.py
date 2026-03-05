@@ -4,13 +4,23 @@ Send reminder notifications to beta users
 Run daily via cron: 0 9 * * * (9 AM every day)
 """
 
+import os
+import sys
 from datetime import datetime
+
+# Add project root to sys.path
+sys.path.append(os.getcwd())
+
 from sqlalchemy.orm import Session
 from db.pg_connections import get_db
 from db.pg_models import User
-from db.pg_models import User
 from subscriptions.beta_service import BetaService
 from subscriptions.notification_service import NotificationService
+from config.logging import get_logger, setup_logging
+
+# Initialize Logging
+setup_logging()
+logger = get_logger(__name__)
 
 def send_beta_reminders():
     """Send reminders to beta users who haven't saved cards"""

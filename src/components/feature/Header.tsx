@@ -20,7 +20,41 @@ const timeAgo = (date: Date) => {
 };
 
 import Button from "../base/Button";
-import { useCurrentUser } from "../../api/user";
+import { useCurrentUser, useBetaStatus } from "../../api/user";
+
+function InlineCountdown({ endsAt }: { endsAt: string }) {
+  const [timeLeft, setTimeLeft] = useState<{ d: number; h: number; m: number; s: number } | null>(null);
+
+  useEffect(() => {
+    const calc = () => {
+      const diff = new Date(endsAt).getTime() - new Date().getTime();
+      if (diff <= 0) {
+        setTimeLeft({ d: 0, h: 0, m: 0, s: 0 });
+        return;
+      }
+      setTimeLeft({
+        d: Math.floor(diff / (1000 * 60 * 60 * 24)),
+        h: Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60)),
+        m: Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60)),
+        s: Math.floor((diff % (1000 * 60)) / 1000),
+      });
+    };
+    calc();
+    const timer = setInterval(calc, 1000);
+    return () => clearInterval(timer);
+  }, [endsAt]);
+
+  if (!timeLeft) return null;
+
+  const pad = (n: number) => n.toString().padStart(2, '0');
+
+  return (
+    <span className="font-mono font-black ml-2 bg-white/20 rounded px-2 py-0.5 text-white text-sm tracking-widest">
+      {timeLeft.d > 0 && <>{timeLeft.d}d&nbsp;</>}
+      {pad(timeLeft.h)}:{pad(timeLeft.m)}:{pad(timeLeft.s)}
+    </span>
+  );
+}
 
 interface HeaderProps {
   onMobileMenuClick?: () => void;
@@ -49,6 +83,7 @@ export default function Header({ onMobileMenuClick }: HeaderProps) {
   const notificationRef = useRef<HTMLDivElement>(null);
 
   const { data: user, isLoading } = useCurrentUser();
+  const { data: betaStatus } = useBetaStatus();
 
   const isLoggedIn = !!user;
   const isAnalyzePage = location.pathname === "/analyze";
@@ -235,27 +270,18 @@ export default function Header({ onMobileMenuClick }: HeaderProps) {
 
   if (!isAdmin)
     return (
-      <header className="bg-white border-b border-gray-200 sticky top-0 z-50">
-        {/* Beta Status Notification Bar */}
-        {user?.is_beta_user && user?.subscription_status !== 'active' && (
-          <div className={`py-2 px-4 text-center text-sm font-medium transition-colors ${!user.stripe_payment_method_id ? 'bg-orange-600 text-white' : 'bg-green-600 text-white'
-            }`}>
-            <div className="max-w-7xl mx-auto flex items-center justify-center space-x-2">
-              {!user.stripe_payment_method_id ? (
-                <>
-                  <span>🎁 Save your card now to secure your access after the beta period!</span>
-                  <button
-                    onClick={() => navigate('/dashboard/upgrade')}
-                    className="ml-2 px-3 py-1 bg-white text-orange-600 rounded-lg text-xs hover:bg-orange-50 transition-colors"
-                  >
-                    Save Card
-                  </button>
-                </>
-              ) : (
-                <>
-                  <span>Congratulations on becoming part of the Lavoo community</span>
-                </>
-              )}
+      <header className="bg-white border-b border-gray-200 sticky top-0 z-[110]">
+        {betaStatus && (betaStatus.status === 'beta_no_card' || betaStatus.status === 'grace_no_card' || betaStatus.status === 'new_user') && (
+          <div className="py-2 px-4 text-center text-sm font-medium transition-colors bg-orange-600 text-white shadow-sm">
+            <div className="max-w-7xl mx-auto flex items-center justify-center space-x-2 flex-wrap gap-y-2">
+              <span>🎁 {betaStatus.message}</span>
+              {betaStatus.countdown_ends_at && <InlineCountdown endsAt={betaStatus.countdown_ends_at} />}
+              <button
+                onClick={() => navigate('/dashboard/upgrade')}
+                className="ml-2 px-3 py-1 bg-white text-orange-600 rounded-full text-xs font-bold hover:bg-orange-50 transition-colors"
+              >
+                {betaStatus.is_beta_user ? 'Save Card' : 'Subscribe'}
+              </button>
             </div>
           </div>
         )}

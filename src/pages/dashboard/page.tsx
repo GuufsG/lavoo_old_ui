@@ -61,7 +61,7 @@ function Dashboard() {
                             <h1 className="text-xl sm:text-2xl md:text-3xl font-bold text-gray-900 mb-2">
                                 Welcome to Lavoo
                             </h1>
-                            {currentUser?.is_beta_user && (
+                            {currentUser?.is_beta_user && (currentUser.app_mode === 'beta' || !currentUser.stripe_payment_method_id) && (
                                 <div className={`mb-4 p-4 rounded-xl border ${!currentUser.stripe_payment_method_id
                                     ? 'bg-orange-50 border-orange-200 text-orange-800'
                                     : 'bg-green-50 border-green-200 text-green-800'
@@ -77,7 +77,9 @@ function Dashboard() {
                                             </h3>
                                             <p className="text-sm">
                                                 {!currentUser.stripe_payment_method_id
-                                                    ? "Secure your access to Lavoo. Checkout today!"
+                                                    ? currentUser.days_remaining !== undefined && currentUser.days_remaining !== null
+                                                        ? `Secure your access to Lavoo. You have ${currentUser.days_remaining} day${currentUser.days_remaining === 1 ? '' : 's'} remaining in your grace period. Checkout today!`
+                                                        : "Secure your access to Lavoo. Checkout today!"
                                                     : "You're all set! Your access is secured."}
                                             </p>
                                             {!currentUser.stripe_payment_method_id && (

@@ -8,13 +8,20 @@ import secrets
 import stripe
 
 from db.pg_connections import get_db
-from db.pg_models import PaymentIntentCreate, PaymentIntentResponse, PaymentVerify, SubscriptionResponse, CreateSubscriptionRequest, UpdatePaymentMethodRequest, ConfirmSubscriptionRequest, SaveCardRequest
+from db.pg_models import (
+    PaymentIntentCreate, PaymentIntentResponse, PaymentVerify,
+    SubscriptionResponse, CreateSubscriptionRequest,
+    UpdatePaymentMethodRequest, ConfirmSubscriptionRequest, SaveCardRequest
+)
 
 from .stripe_service import StripeService
 from db.pg_models import User, Subscriptions
 from api.routes.login import get_current_user
 import json
+import logging
 import traceback
+
+logger = logging.getLogger(__name__)
 
 from fastapi import BackgroundTasks
 from emailing.email_service import email_service
@@ -25,9 +32,39 @@ from .beta_service import BetaService
 router = APIRouter(prefix="/api/stripe", tags=["stripe"])
 
 
-# Price IDs - Helper function to get from environment dynamically
+# ---------------------------------------------------------------------------
+# BILLING FLOW OVERVIEW
+# ---------------------------------------------------------------------------
+#
+# BETA USERS (APP_MODE=beta):
+#   1. User registers → grace period set to launch_date + grace_days
+#   2. User visits /upgrade → sees "save card" CTA
+#   3. User saves card via POST /save-card-beta
+#      → Card attached to Stripe customer, stored on user record
+#      → NO subscription created yet (billing deferred to launch)
+#   4. At launch (APP_MODE=launch):
+#      → save-card-beta detects launch mode and immediately creates subscription
+#      → OR a migration script calls create_subscription_with_saved_card for all
+#         beta users who saved cards but haven't been billed yet
+#   5. Subscription created → invoice.payment_succeeded fires → webhook updates DB
+#
+# NEW USERS AFTER LAUNCH (APP_MODE=launch):
+#   1. User registers → grace period set to now + grace_days
+#   2. User visits /upgrade → sees plan pricing
+#   3. User pays via POST /create-subscription-with-saved-card
+#      → Stripe Subscription (sub_xxx) created immediately
+#      → If 3DS needed: frontend confirms, then POST /confirm-subscription
+#      → DB record created, user.stripe_subscription_id stored
+#   4. On renewal: Stripe fires invoice.payment_succeeded → webhook extends end_date
+#   5. On failure: Stripe fires invoice.payment_failed → webhook can notify user
+#
+# IMPORTANT: Never use create-payment-intent for subscriptions.
+# PaymentIntents are one-time charges — Stripe will never auto-renew them.
+# ---------------------------------------------------------------------------
+
+
 def get_stripe_price_id(plan_type: str) -> str:
-    """Get Price ID relative to plan type from environment"""
+    """Get Price ID for a plan type from environment variables."""
     env_keys = {
         "monthly": "STRIPE_MONTHLY_PRICE_ID",
         "yearly": "STRIPE_YEARLY_PRICE_ID",
@@ -36,46 +73,93 @@ def get_stripe_price_id(plan_type: str) -> str:
     key = env_keys.get(plan_type)
     if not key:
         return ""
-    # Strip any potential whitespace from the env value
-    val = os.getenv(key, "")
-    return val.strip()
+    return os.getenv(key, "").strip()
 
 
 def generate_tx_ref(prefix: str = "STRIPE") -> str:
-    """Generate a unique transaction reference"""
+    """Generate a unique transaction reference."""
     timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
     random_str = secrets.token_hex(4).upper()
     return f"{prefix}-{timestamp}-{random_str}"
 
 
-def calculate_subscription_dates(plan_type: str):
-    """Calculate subscription start and end dates"""
-    start_date = datetime.utcnow()
+def extract_user_id(current_user) -> int:
+    """
+    Centralised helper to extract user_id from whatever shape get_current_user returns.
+    Eliminates the repeated if/elif blocks scattered across every endpoint.
+    """
+    if isinstance(current_user, dict):
+        if "user" in current_user:
+            user_data = current_user["user"]
+            if isinstance(user_data, dict):
+                uid = user_data.get("id") or user_data.get("user_id")
+            elif hasattr(user_data, 'id'):
+                uid = user_data.id
+            else:
+                uid = user_data
+        else:
+            uid = current_user.get("id") or current_user.get("user_id") or current_user.get("sub")
+        if uid is None:
+            raise HTTPException(status_code=500, detail="Could not extract user_id from token")
+        return int(uid)
+    return int(current_user.id)
+
+
+def get_subscription_dates_from_stripe(subscription_result: dict, plan_type: str):
+    """
+    Get subscription start/end dates from Stripe's response.
     
-    if plan_type == "monthly":
-        end_date = start_date + timedelta(days=30)
-    elif plan_type == "quarterly":
-        end_date = start_date + timedelta(days=90)
-    elif plan_type == "yearly":
-        end_date = start_date + timedelta(days=365)
+    ALWAYS prefer Stripe's current_period_start/end over local timedelta calculation.
+    Stripe owns the billing cycle — local timedelta drifts over time and disagrees
+    with what Stripe will actually charge on the next cycle.
+    
+    Falls back to timedelta only if Stripe didn't return period data (e.g. incomplete
+    subscription before first payment).
+    """
+    period_start = subscription_result.get("current_period_start")
+    period_end = subscription_result.get("current_period_end")
+    
+    # Try latest_invoice if dates are missing (common for incomplete subscriptions)
+    if not (period_start and period_end):
+        latest_invoice = subscription_result.get("latest_invoice")
+        if isinstance(latest_invoice, dict):
+            lines = latest_invoice.get("lines", {}).get("data", [])
+            for line in lines:
+                if line.get("period"):
+                    period_start = period_start or line["period"].get("start")
+                    period_end = period_end or line["period"].get("end")
+                    if period_start and period_end:
+                        logger.info(f"📅 Extracted period dates from latest_invoice: {period_start} -> {period_end}")
+                        break
+
+    if period_start and period_end:
+        try:
+            start_date = datetime.fromtimestamp(int(period_start))
+            end_date = datetime.fromtimestamp(int(period_end))
+            logger.info(f"📅 Using Stripe authoritative dates: {start_date} -> {end_date}")
+            return start_date, end_date
+        except (ValueError, TypeError, OverflowError) as e:
+            logger.warning(f"⚠️ Error parsing Stripe timestamps: {e}. Falling back.")
+    
+    # Fallback for incomplete subscriptions awaiting 3DS
+    status = subscription_result.get("status", "unknown")
+    if status == "incomplete":
+        logger.info(f"ℹ️ Subscription {subscription_result.get('id')} is incomplete; using estimated dates for {plan_type}")
     else:
-        raise ValueError(f"Invalid plan type: {plan_type}")
-    
-    return start_date, end_date
+        logger.warning(f"⚠️ Stripe period data missing for {plan_type} (status: {status}), falling back to timedelta")
+        
+    start = datetime.utcnow()
+    delta_map = {"monthly": 30, "quarterly": 90, "yearly": 365}
+    return start, start + timedelta(days=delta_map.get(plan_type, 30))
 
 
 @router.get("/config")
 async def get_stripe_config():
-    """
-    Get Stripe publishable key for frontend
-    """
+    """Get Stripe publishable key for frontend."""
     publishable_key = os.getenv("STRIPE_PUBLISHABLE_KEY")
     if not publishable_key:
         raise HTTPException(status_code=500, detail="Stripe configuration not found")
-    
-    return {
-        "publishableKey": publishable_key
-    }
+    return {"publishableKey": publishable_key}
 
 
 @router.get("/history", response_model=list[SubscriptionResponse])
@@ -83,29 +167,23 @@ async def get_subscription_history(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Get current user's subscription/payment history
-    """
+    """Get current user's subscription/payment history."""
     try:
-        # Handle current_user types
-        if isinstance(current_user, dict):
-            if "user" in current_user:
-                user_data = current_user["user"]
-                user_id = user_data.get("id") if isinstance(user_data, dict) else (getattr(user_data, "id", None) or user_data)
-            else:
-                user_id = current_user.get("id") or current_user.get("sub")
-        else:
-            user_id = current_user.id
-
+        user_id = extract_user_id(current_user)
         subscriptions = db.query(Subscriptions).filter(
             Subscriptions.user_id == user_id
         ).order_by(Subscriptions.created_at.desc()).all()
-        
         return subscriptions
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error fetching subscription history: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch subscription history")
 
+
+# ---------------------------------------------------------------------------
+# LEGACY ENDPOINT — kept for backwards compatibility only
+# New signups should use /create-subscription-with-saved-card
+# ---------------------------------------------------------------------------
 
 @router.post("/create-payment-intent", response_model=PaymentIntentResponse)
 async def create_payment_intent(
@@ -114,49 +192,22 @@ async def create_payment_intent(
     db: Session = Depends(get_db)
 ):
     """
-    Create a Stripe Payment Intent
+    LEGACY: Create a one-time Stripe Payment Intent.
+    
+    ⚠️  DO NOT use this for subscriptions. This creates a single charge only.
+    Stripe will never auto-renew a PaymentIntent — that's why test payments
+    didn't appear as subscriptions in the Stripe dashboard.
+    
+    This endpoint is retained so existing clients don't break, but all new
+    subscription flows must use /create-subscription-with-saved-card.
     """
     try:
-        # Handle different types of current_user
-        if isinstance(current_user, dict):
-            # Extract user_id from nested structure
-            if "user" in current_user:
-                user_data = current_user["user"]
-                if isinstance(user_data, dict):
-                    user_id = user_data.get("id") or user_data.get("user_id")
-                elif hasattr(user_data, 'id'):
-                    # user_data is a User object
-                    user_id = user_data.id
-                else:
-                    # user_data is directly the user_id
-                    user_id = user_data
-            else:
-                # Try common key names
-                user_id = current_user.get("id") or current_user.get("user_id") or current_user.get("sub")
-            
-            if user_id is None:
-                raise HTTPException(
-                    status_code=500, 
-                    detail=f"Could not extract user_id from token"
-                )
-        else:
-            # current_user is a User object
-            user_id = current_user.id
+        user_id = extract_user_id(current_user)
         
-        print(f"DEBUG: Extracted user_id: {user_id}")
-        print(f"DEBUG: Requested user_id: {payment_data.user_id}")
+        if int(payment_data.user_id) != user_id:
+            raise HTTPException(status_code=403, detail="Unauthorized")
         
-        # Verify the user_id matches the authenticated user (convert to int for comparison)
-        if int(payment_data.user_id) != int(user_id):
-            raise HTTPException(
-                status_code=403, 
-                detail=f"Unauthorized: user_id {payment_data.user_id} does not match authenticated user {user_id}"
-            )
-        
-        # Generate unique transaction reference
         tx_ref = generate_tx_ref("STRIPE")
-        
-        # Create payment intent with Stripe (subscription will be created AFTER payment succeeds)
         intent = StripeService.create_payment_intent(
             amount=payment_data.amount,
             currency="usd",
@@ -165,22 +216,15 @@ async def create_payment_intent(
                 "user_id": str(payment_data.user_id),
                 "plan_type": payment_data.plan_type,
                 "customer_name": payment_data.name,
-                "tx_ref": tx_ref
+                "tx_ref": tx_ref,
+                "legacy_payment_intent": "true"  # Flag for webhook identification
             }
         )
-        
-        # NOTE: We no longer create subscription here.
-        # Subscription is created ONLY after payment succeeds (in verify_payment or webhook)
-        # This prevents duplicate entries for failed/abandoned payments
-        
         return intent
         
     except HTTPException:
-        db.rollback()
         raise
     except Exception as e:
-        db.rollback()
-        print(f"Error in create_payment_intent: {str(e)}")  # Debug logging
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -192,86 +236,64 @@ async def verify_payment(
     db: Session = Depends(get_db)
 ):
     """
-    Verify payment and CREATE subscription on success with commission calculation.
-    Subscription is only created here - not when payment intent is created.
+    LEGACY: Verify a PaymentIntent and create a local subscription record.
+    
+    ⚠️  This works for the initial payment but the subscription will NOT
+    auto-renew because there is no Stripe Subscription (sub_xxx) object.
+    Users paid through this flow need to be migrated — see comments in
+    the invoice.payment_succeeded webhook handler.
     """
     try:
-        # Extract user_id (your existing logic)
-        if isinstance(current_user, dict):
-            if "user" in current_user:
-                user_data = current_user["user"]
-                if isinstance(user_data, dict):
-                    user_id = user_data.get("id") or user_data.get("user_id")
-                elif hasattr(user_data, 'id'):
-                    user_id = user_data.id
-                else:
-                    user_id = user_data
-            else:
-                user_id = current_user.get("id") or current_user.get("user_id") or current_user.get("sub")
-            
-            if user_id is None:
-                raise HTTPException(status_code=500, detail="Could not extract user_id from token")
-        else:
-            user_id = current_user.id
+        user_id = extract_user_id(current_user)
         
-        if int(payment_verify.user_id) != int(user_id):
+        if int(payment_verify.user_id) != user_id:
             raise HTTPException(status_code=403, detail="Unauthorized")
         
-        # Verify with Stripe
         verification = StripeService.verify_payment(payment_verify.payment_intent_id)
         
         if verification["status"] != "succeeded":
-            # Notify user about payment failure via Dashboard
             NotificationService.create_notification(
                 db=db,
                 user_id=payment_verify.user_id,
                 type=NotificationType.PAYMENT_FAILED.value,
                 title="Payment Failed",
-                message=f"Your payment of ${float(verification.get('amount', 0))} was not successful (Status: {verification['status']}).",
+                message=f"Your payment was not successful (Status: {verification['status']}).",
                 link="/dashboard/upgrade"
             )
-            
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Payment not successful. Status: {verification['status']}"
-            )
+            raise HTTPException(status_code=400, detail=f"Payment not successful. Status: {verification['status']}")
         
-        # Check for duplicate (already processed)
         existing_sub = db.query(Subscriptions).filter(
             Subscriptions.transaction_id == payment_verify.payment_intent_id
         ).first()
-        
         if existing_sub:
-            print(f"⚠️ Payment {payment_verify.payment_intent_id} already processed")
             return existing_sub
         
-        # Extract metadata from payment intent
         metadata = verification.get("metadata", {})
         plan_type = metadata.get("plan_type", "monthly")
         tx_ref = metadata.get("tx_ref", generate_tx_ref("STRIPE"))
         
-        # Calculate subscription dates
-        start_date, end_date = calculate_subscription_dates(plan_type)
+        # Use timedelta here since there's no Stripe Subscription to pull dates from.
+        # These users will not auto-renew — they need to be migrated to proper subscriptions.
+        start_date = datetime.utcnow()
+        delta_map = {"monthly": 30, "quarterly": 90, "yearly": 365}
+        end_date = start_date + timedelta(days=delta_map.get(plan_type, 30))
         
-        # CREATE subscription record (only on success)
         subscription = Subscriptions(
             user_id=payment_verify.user_id,
             subscription_plan=plan_type,
             transaction_id=payment_verify.payment_intent_id,
             tx_ref=tx_ref,
-            amount=Decimal(str(verification.get("amount", 0))),  # Already in dollars from Service
+            amount=Decimal(str(verification.get("amount", 0))),
             currency=verification.get("currency", "USD").upper(),
-            status="completed",  # Already succeeded
+            status="completed",
             subscription_status="active",
             payment_provider="stripe",
             start_date=start_date,
             end_date=end_date
         )
-        
         db.add(subscription)
-        db.flush()  # Get subscription ID for commission
+        db.flush()
         
-        # Update user's subscription status
         user = db.query(User).filter(User.id == payment_verify.user_id).first()
         if user:
             if hasattr(user, 'subscription_status'):
@@ -281,37 +303,26 @@ async def verify_payment(
             if hasattr(user, 'subscription_expires_at'):
                 user.subscription_expires_at = end_date
         
-        # Calculate commission
         from subscriptions.commission_service import CommissionService
-        
-        commission = CommissionService.calculate_commission(
-            subscription=subscription,
-            db=db
-        )
-        
-        if commission:
-            print(f"✅ Commission created: ${commission.amount} for referrer {commission.user_id}")
-        else:
-            print(f"ℹ️  No commission created (user not referred)")
+        CommissionService.calculate_commission(subscription=subscription, db=db)
         
         db.commit()
         db.refresh(subscription)
-        background_tasks.add_task(
-            email_service.send_payment_success_email,
-            user.email,
-            user.name,
-            float(verification.get("amount", 0)),
-            plan_type,
-            end_date.strftime("%B %d, %Y")
-        )
-
-        # Notify user about successful subscription
+        
+        if user:
+            background_tasks.add_task(
+                email_service.send_payment_success_email,
+                user.email, user.name,
+                float(verification.get("amount", 0)),
+                plan_type, end_date.strftime("%B %d, %Y")
+            )
+        
         NotificationService.create_notification(
             db=db,
             user_id=payment_verify.user_id,
             type=NotificationType.PAYMENT_SUCCESS.value,
             title="Subscription Active!",
-            message=f"Your {plan_type} subscription is now active. Thank you for your payment of ${float(verification.get('amount', 0))}.",
+            message=f"Your {plan_type} subscription is now active.",
             link="/dashboard"
         )
         return subscription
@@ -319,18 +330,16 @@ async def verify_payment(
     except HTTPException:
         db.rollback()
         raise
-    except stripe.error.StripeError as e:
-        db.rollback()
-        print(f"Stripe Verification Error: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         db.rollback()
-        print(f"Unexpected Verification Error: {str(e)}")
-        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(e))
-   
- 
+
+
+# ---------------------------------------------------------------------------
+# BETA CARD SAVE
+# ---------------------------------------------------------------------------
+
 @router.post("/save-card-beta")
 async def save_card_for_beta(
     request: SaveCardRequest,
@@ -339,161 +348,195 @@ async def save_card_for_beta(
     db: Session = Depends(get_db)
 ):
     """
-    ✅ PCI-COMPLIANT: Save card during beta period
+    Save a payment card during the beta period OR immediately bill in launch mode.
     
-    Security:
-    - Card data never touches our servers
-    - Only Stripe tokens are stored
-    - Stripe handles all PCI compliance
+    BETA MODE (APP_MODE=beta):
+        - Attaches payment method to Stripe customer
+        - Stores card metadata on user record (last4, brand, etc.)
+        - Does NOT create a Stripe Subscription yet
+        - User is marked as beta user with grace period tied to launch date
+        - At launch, all beta users with saved cards are billed via a migration
+          or the next call in launch mode triggers billing automatically
+    
+    LAUNCH MODE (APP_MODE=launch):
+        - Same card save as above
+        - Additionally creates a Stripe Subscription immediately
+        - Uses the price_id matching user.subscription_plan (defaults to monthly)
+        - Subscription auto-renews from this point forward
+        - If 3DS required → returns requires_action with client_secret
     """
     try:
-        # Extract user_id
-        if isinstance(current_user, dict):
-            if "user" in current_user:
-                user_data = current_user["user"]
-                user_id = user_data.get("id") if isinstance(user_data, dict) else getattr(user_data, "id", None)
-            else:
-                user_id = current_user.get("id")
-        else:
-            user_id = current_user.id
-        
+        user_id = extract_user_id(current_user)
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         
-        # Check if allowed to save cards
         from subscriptions.beta_service import BetaService
         
-        # Allow during beta OR during grace period
-        if not BetaService.is_beta_mode() and not BetaService.is_in_grace_period():
+        app_mode = BetaService.get_app_mode()
+        
+        if not BetaService.is_beta_mode() and not BetaService.is_in_grace_period(user) and app_mode != "launch":
             raise HTTPException(
                 status_code=400,
                 detail="Grace period has ended. Please subscribe to continue using Lavoo."
             )
         
         # Get or create Stripe customer
-        stripe_customer_id = user.stripe_customer_id
         customer_id = StripeService.get_or_create_customer(
             user_id=user_id,
             email=user.email,
             name=user.name,
-            stripe_customer_id=stripe_customer_id
+            stripe_customer_id=getattr(user, 'stripe_customer_id', None)
         )
         
-        # Save customer ID if new
-        if not stripe_customer_id:
+        if not getattr(user, 'stripe_customer_id', None):
             user.stripe_customer_id = customer_id
         
-        # Attach payment method to customer
+        # Attach payment method and set as default for future subscription billing
         StripeService.attach_payment_method(
             payment_method_id=request.payment_method_id,
             customer_id=customer_id,
             set_as_default=True
         )
         
-        # ✅ PCI-COMPLIANT: Retrieve ONLY safe metadata from Stripe
+        # Store safe card metadata (PCI compliant — no full card numbers)
         payment_method = stripe.PaymentMethod.retrieve(request.payment_method_id)
-        
-        # Store only non-sensitive data
         user.stripe_payment_method_id = request.payment_method_id
-        user.card_last4 = payment_method.card.last4  # Safe: last 4 digits
-        user.card_brand = payment_method.card.brand  # Safe: Visa, Mastercard, etc.
-        user.card_exp_month = payment_method.card.exp_month  # Safe: expiration
-        user.card_exp_year = payment_method.card.exp_year  # Safe: expiration
+        user.card_last4 = payment_method.card.last4
+        user.card_brand = payment_method.card.brand
+        user.card_exp_month = payment_method.card.exp_month
+        user.card_exp_year = payment_method.card.exp_year
         user.card_saved_at = datetime.utcnow()
-        
-        # Mark as beta user only if we are currently in BETA mode
-        if BetaService.is_beta_mode() and not user.is_beta_user:
+
+        # Persist the plan the user selected so the cron script and launch billing
+        # use the correct price. Without this, user.subscription_plan stays None
+        # and both flows fall back to "monthly" regardless of user selection.
+        requested_plan = getattr(request, 'plan_type', None) or getattr(user, 'subscription_plan', None) or "monthly"
+        if hasattr(user, 'subscription_plan'):
+            user.subscription_plan = requested_plan
+
+        if BetaService.is_beta_mode():
             BetaService.mark_as_beta_user(user, db)
+
+        # LAUNCH MODE: Immediately create a Stripe Subscription
+        # This covers two cases:
+        #   (a) User saves card after launch — bill immediately
+        #   (b) Beta user (already had card) whose save-card is re-triggered at launch
+        if app_mode == "launch" and not (hasattr(user, 'stripe_subscription_id') and user.stripe_subscription_id):
+            logger.info(f"🚀 [LAUNCH] Triggering immediate billing for user {user.id} ({user.email})")
+            try:
+                plan_type = requested_plan
+                price_id = get_stripe_price_id(plan_type)
+                
+                if not price_id:
+                    logger.error(f"No price_id found for plan {plan_type}")
+                    raise HTTPException(status_code=400, detail=f"Price not configured for plan: {plan_type}")
+                
+                sub_result = StripeService.create_subscription_with_saved_card(
+                    customer_id=customer_id,
+                    price_id=price_id,
+                    payment_method_id=request.payment_method_id,
+                    metadata={
+                        "user_id": str(user.id),
+                        "plan_type": plan_type,
+                        "source": "beta_launch_billing"
+                    },
+                    off_session=False  # User IS present — allow 3DS modal via frontend
+                )
+                
+                if sub_result.get("status") == "incomplete":
+                    # 3D Secure required — commit card save, return action required
+                    db.commit()
+                    return {
+                        "status": "requires_action",
+                        "subscription_id": sub_result["subscription_id"],
+                        "payment_intent_id": sub_result.get("payment_intent_id"),
+                        "client_secret": sub_result.get("client_secret"),
+                        "message": "Additional authentication required"
+                    }
+                
+                if sub_result.get("status") in ["active", "trialing"]:
+                    # Use Stripe's period dates — not local timedelta
+                    start_date, end_date = get_subscription_dates_from_stripe(sub_result, plan_type)
+                    
+                    if hasattr(user, 'stripe_subscription_id'):
+                        user.stripe_subscription_id = sub_result["subscription_id"]
+                    
+                    # Get pricing from settings
+                    from api.routes.control.settings import get_settings
+                    settings = get_settings(db=db, current_user=user)
+                    price_map = {
+                        "monthly": settings.monthly_price,
+                        "quarterly": settings.quarterly_price,
+                        "yearly": settings.yearly_price
+                    }
+                    amount = price_map.get(plan_type, 29.95)
+                    
+                    subscription = Subscriptions(
+                        user_id=user.id,
+                        subscription_plan=plan_type,
+                        transaction_id=sub_result["subscription_id"],
+                        tx_ref=generate_tx_ref("LAUNCH"),
+                        amount=Decimal(str(amount)),
+                        currency="USD",
+                        status="completed",
+                        subscription_status="active",
+                        payment_provider="stripe",
+                        start_date=start_date,
+                        end_date=end_date
+                    )
+                    db.add(subscription)
+                    db.flush()
+                    
+                    user.subscription_status = "active"
+                    user.subscription_expires_at = end_date
+                    if hasattr(user, 'subscription_plan'):
+                        user.subscription_plan = plan_type
+                    
+                    from subscriptions.commission_service import CommissionService
+                    CommissionService.calculate_commission(subscription=subscription, db=db)
+                    
+                    background_tasks.add_task(
+                        email_service.send_payment_success_email,
+                        user.email, user.name, float(amount),
+                        plan_type, end_date.strftime("%B %d, %Y")
+                    )
+                    
+                    NotificationService.create_notification(
+                        db=db, user_id=user.id,
+                        type="subscription_active",
+                        title="Subscription Activated",
+                        message="Your subscription is now active. Welcome to Lavoo!",
+                        link="/dashboard/upgrade"
+                    )
+                    logger.info(f"✅ Launch billing successful for user {user.id}")
+                    
+            except HTTPException:
+                raise
+            except Exception as auto_err:
+                logger.error(f"❌ Launch billing failed for user {user.id}: {str(auto_err)}")
+                logger.error(traceback.format_exc())
+                # Don't re-raise — card is saved even if billing fails
+                # The billing attempt will be retried via migration script
         
         db.commit()
         
-        # Send success notification
-        from subscriptions.notification_service import NotificationService
-        NotificationService.send_card_saved_success(db, user)
-        
-        # Send email confirmation
+        # Send card-saved confirmation email (beta or regular)
         background_tasks.add_task(
             email_service.send_beta_card_saved_email,
-            user.email,
-            user.name,
-            user.card_last4,
-            user.card_brand,
+            user.email, user.name, user.card_last4, user.card_brand,
             BetaService.get_grace_period_days()
         )
         
-        # Trigger automatic billing if in LAUNCH mode and user isn't active
-        if BetaService.get_app_mode() == "launch" and user.subscription_status != "active":
-            print(f"🚀 LAUNCH MODE: Triggering immediate billing for user {user.id}")
-            try:
-                # Default to monthly if not set
-                # LAUNCH MODE: Trigger immediate billing
-                logger.info(f"🚀 [LAUNCH MODE] Immediate billing triggered for user {user.id} ({user.email})")
-                plan_type = user.subscription_plan or "monthly"
-                price_id = get_stripe_price_id(plan_type)
-                if price_id:
-                    sub_result = StripeService.create_subscription_with_saved_card(
-                        customer_id=user.stripe_customer_id,
-                        price_id=price_id,
-                        payment_method_id=request.payment_method_id,
-                        metadata={
-                            "user_id": str(user.id),
-                            "plan_type": plan_type,
-                            "auto_billed_on_card_save": "true"
-                        }
-                    )
-                    if sub_result.get("status") in ["active", "trialing", "incomplete"]:
-                        start_date, end_date = calculate_subscription_dates(plan_type)
-                        user.stripe_subscription_id = sub_result["subscription_id"]
-                        user.subscription_status = sub_result["status"]
-                        user.subscription_expires_at = end_date
-                        logger.info(f"✅ Immediate billing successful for user {user.id}. Status: {user.subscription_status}, Expires: {user.subscription_expires_at}")
-                        
-                        # Create local subscription record
-                        from api.routes.control.settings import get_settings
-                        settings = get_settings(db=db, current_user=user)
-                        
-                        price_map = {
-                            "monthly": settings.monthly_price,
-                            "quarterly": settings.quarterly_price,
-                            "yearly": settings.yearly_price
-                        }
-                        amount = price_map.get(plan_type, 29.95)
-
-                        subscription = Subscriptions(
-                            user_id=user.id,
-                            subscription_plan=plan_type,
-                            transaction_id=sub_result["subscription_id"],
-                            tx_ref=generate_tx_ref("AUTO"),
-                            amount=Decimal(str(amount)),
-                            currency="USD",
-                            status="completed",
-                            subscription_status="active",
-                            payment_provider="stripe",
-                            start_date=start_date,
-                            end_date=end_date
-                        )
-                        db.add(subscription)
-                        db.flush()
-                        
-                        # Calculate commission
-                        from subscriptions.commission_service import CommissionService
-                        CommissionService.calculate_commission(subscription=subscription, db=db)
-                        
-                        # Send success email
-                        background_tasks.add_task(
-                            email_service.send_payment_success_email,
-                            user.email,
-                            user.name,
-                            float(amount),
-                            plan_type,
-                            end_date.strftime("%B %d, %Y")
-                        )
-                        
-                        print(f"✅ Auto-billing successful for user {user.id}")
-            except Exception as auto_err:
-                print(f"❌ Auto-billing failed (silent): {str(auto_err)}")
-
+        NotificationService.create_notification(
+            db=db,
+            user_id=user.id,
+            type="card_saved",
+            title="✅ Card Saved Successfully",
+            message="Congratulations on becoming a part of the Lavoo Community! Your card is securely saved." if BetaService.is_beta_mode() else "Congratulations on becoming a part of the Lavoo Community! Your subscription is now active.",
+            link="/dashboard"
+        )
+        
         return {
             "status": "success",
             "message": "Congratulations on becoming a part of the Lavoo Community",
@@ -512,14 +555,10 @@ async def save_card_for_beta(
         raise
     except stripe.error.CardError as e:
         db.rollback()
-        # Clean error for card declines - no traceback needed
         error_msg = str(e.user_message) if hasattr(e, 'user_message') else str(e)
-        print(f"Card declined for user {user.id}: {error_msg}")
         raise HTTPException(status_code=400, detail=error_msg)
     except Exception as e:
         db.rollback()
-        print(f"Error saving beta card: {str(e)}")
-        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -529,29 +568,16 @@ async def get_beta_status(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Get user's beta status for dashboard display
-    """
+    """Get user's beta/subscription status for dashboard display."""
     try:
-        # Extract user_id
-        if isinstance(current_user, dict):
-            if "user" in current_user:
-                user_data = current_user["user"]
-                user_id = user_data.get("id") if isinstance(user_data, dict) else getattr(user_data, "id", None)
-            else:
-                user_id = current_user.get("id")
-        else:
-            user_id = current_user.id
-        
+        user_id = extract_user_id(current_user)
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         
         from subscriptions.beta_service import BetaService
-        
         status = BetaService.get_user_status(user)
         
-        # Add card info if available
         if status.get("show_card_info") and user.card_last4:
             status["card_info"] = {
                 "last4": user.card_last4,
@@ -561,259 +587,345 @@ async def get_beta_status(
             }
         
         status["is_beta_mode"] = BetaService.is_beta_mode()
-        status["is_in_grace_period"] = BetaService.is_in_grace_period()
-        
+        status["is_in_grace_period"] = BetaService.is_in_grace_period(user)
         return status
         
     except Exception as e:
-        print(f"Error getting beta status: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# WEBHOOK
+# ---------------------------------------------------------------------------
+
 @router.post("/webhook")
-async def stripe_webhook(request: Request, stripe_signature: Optional[str] = Header(None, alias="stripe-signature"), db: Session = Depends(get_db)):
+async def stripe_webhook(
+    request: Request,
+    stripe_signature: Optional[str] = Header(None, alias="stripe-signature"),
+    db: Session = Depends(get_db)
+):
     """
-    Handle Stripe webhooks with commission calculation.
-    This is a fallback - subscription may already be created by verify_payment.
-    Also handles Payout events for Connect transfers.
+    Handle Stripe webhook events.
+    
+    Critical events handled:
+    
+    invoice.payment_succeeded
+        Fired on every successful subscription renewal (and the first payment).
+        This is how we extend subscription access after each billing cycle.
+        Uses Stripe's current_period_end as the authoritative end date.
+    
+    invoice.payment_failed
+        Fired when Stripe's Smart Retries are exhausted. Notify user to update card.
+    
+    customer.subscription.deleted
+        Fired when a subscription is fully cancelled (after period end or immediately).
+        Revokes user access.
+    
+    customer.subscription.updated
+        Fired when a subscription changes status (e.g. past_due, active after retry).
+    
+    payment_intent.succeeded (LEGACY)
+        Only processes PaymentIntents tagged with legacy_payment_intent=true in metadata.
+        Handles old-flow users who paid before the subscription migration.
     """
     try:
         payload = await request.body()
         
-        # Allow bypass for manual testing with curl if not in production
         is_production = os.getenv("ENVIRONMENT", "development") == "production"
         if not stripe_signature and not is_production:
-            print("⚠️ Webhook: Manual test detected (no signature). Bypassing verification.")
+            logger.warning("⚠️ Webhook: No signature — manual test mode")
             try:
                 event_data = json.loads(payload)
                 event = stripe.Event.construct_from(event_data, stripe.api_key)
             except Exception as e:
-                print(f"❌ Webhook: Failed to parse manual payload: {str(e)}")
                 raise HTTPException(status_code=400, detail="Invalid JSON payload")
         else:
             event = StripeService.verify_webhook_signature(payload, stripe_signature)
         
-        # --- IDEMPOTENCY CHECK ---
-        # Although handled by logic checks, good to log the event ID
+        logger.info(f"📨 Webhook received: {event.type}")
         
-        if event.type == "payment_intent.succeeded":
-            payment_intent = event.data.object
+        # ------------------------------------------------------------------
+        # invoice.payment_succeeded
+        # The primary renewal handler. Fired for every successful invoice
+        # payment — both the first subscription payment and all renewals.
+        # ------------------------------------------------------------------
+        if event.type == "invoice.payment_succeeded":
+            invoice = event.data.object
+            subscription_id = invoice.get("subscription")
             
-            # Check if subscription already exists
-            subscription = db.query(Subscriptions).filter(
-                Subscriptions.transaction_id == payment_intent.id
+            if not subscription_id:
+                # One-time invoice, not a subscription invoice — skip
+                return {"status": "success"}
+            
+            logger.info(f"🔄 Renewal/payment for subscription {subscription_id}")
+            
+            # Retrieve the full subscription to get authoritative period dates
+            stripe_sub = stripe.Subscription.retrieve(subscription_id)
+            start_date = datetime.fromtimestamp(stripe_sub.current_period_start)
+            end_date = datetime.fromtimestamp(stripe_sub.current_period_end)
+            
+            # Find the user by their stored stripe_subscription_id
+            user = db.query(User).filter(
+                User.stripe_subscription_id == subscription_id
             ).first()
             
-            if subscription:
-                # Already processed (by verify_payment) - just ensure status is correct
-                if subscription.status != "completed":
-                    subscription.status = "completed"
-                    db.commit()
-                print(f"✅ Webhook: Subscription {subscription.id} already exists")
-            else:
-                # Create new subscription (fallback if verify_payment wasn't called)
-                metadata = payment_intent.metadata or {}
-                user_id = int(metadata.get("user_id", 0))
-                plan_type = metadata.get("plan_type", "monthly")
-                tx_ref = metadata.get("tx_ref", generate_tx_ref("STRIPE"))
-                
-                if user_id:
-                    start_date, end_date = calculate_subscription_dates(plan_type)
-                    
-                    subscription = Subscriptions(
-                        user_id=user_id,
-                        subscription_plan=plan_type,
-                        transaction_id=payment_intent.id,
-                        tx_ref=tx_ref,
-                        amount=Decimal(str(payment_intent.amount / 100)),
-                        currency=payment_intent.currency.upper(),
-                        status="completed",
-                        subscription_status="active",
-                        payment_provider="stripe",
-                        start_date=start_date,
-                        end_date=end_date
-                    )
-                    db.add(subscription)
-                    db.flush()
-                    
-                    # Update user
-                    user = db.query(User).filter(User.id == user_id).first()
-                    if user:
-                        if hasattr(user, 'subscription_status'):
-                            user.subscription_status = "active"
-                        if hasattr(user, 'subscription_plan'):
-                            user.subscription_plan = plan_type
-                        if hasattr(user, 'subscription_expires_at'):
-                            user.subscription_expires_at = end_date
-                    
-                    # Calculate commission
-                    from subscriptions.commission_service import CommissionService
-                    commission = CommissionService.calculate_commission(subscription=subscription, db=db)
-                    if commission:
-                        print(f"✅ Webhook: Commission created ${commission.amount}")
-                    
-                    db.commit()
-                    print(f"✅ Webhook: Created subscription {subscription.id}")
-        
-        elif event.type == "payment_intent.payment_failed":
-            # No subscription to update if we don't create on failure
-            print(f"⚠️ Webhook: Payment failed for {event.data.object.id}")
+            if not user:
+                # Fallback: try to find user via invoice metadata
+                metadata = getattr(invoice, 'metadata', {}) or {}
+                user_id_meta = metadata.get("user_id")
+                if user_id_meta:
+                    user = db.query(User).filter(User.id == int(user_id_meta)).first()
             
-        elif event.type == "invoice.payment_succeeded":
+            if not user:
+                logger.warning(f"⚠️ No user found for subscription {subscription_id}")
+                return {"status": "success"}
+            
+            # Idempotency: skip if this invoice was already processed
+            existing = db.query(Subscriptions).filter(
+                Subscriptions.transaction_id == invoice.payment_intent
+            ).first()
+            if existing:
+                logger.info(f"ℹ️ Invoice {invoice.payment_intent} already recorded, skipping")
+                return {"status": "success"}
+            
+            # Extend subscription access using Stripe's period end (not timedelta)
+            user.subscription_status = "active"
+            user.subscription_expires_at = end_date
+            if hasattr(user, 'stripe_subscription_id') and not user.stripe_subscription_id:
+                user.stripe_subscription_id = subscription_id
+            
+            # Create a historical billing record for this period
+            new_sub = Subscriptions(
+                user_id=user.id,
+                subscription_plan=user.subscription_plan or "monthly",
+                transaction_id=invoice.payment_intent,
+                tx_ref=f"RENEW-{user.id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
+                amount=Decimal(str(invoice.amount_paid / 100)),
+                currency=invoice.currency.upper(),
+                status="completed",
+                subscription_status="active",
+                payment_provider="stripe",
+                start_date=start_date,
+                end_date=end_date
+            )
+            db.add(new_sub)
+            db.flush()
+            
+            from subscriptions.commission_service import CommissionService
+            CommissionService.calculate_commission(subscription=new_sub, db=db)
+            
+            db.commit()
+            logger.info(f"✅ Renewal recorded for user {user.id}, expires {end_date}")
+            
+            NotificationService.create_notification(
+                db=db,
+                user_id=user.id,
+                type="subscription_renewed",
+                title="✅ Subscription Renewed",
+                message=f"Your subscription has been successfully renewed. Your access is secured until {end_date.strftime('%B %d, %Y')}.",
+                link="/dashboard/upgrade"
+            )
+            db.commit()
+        
+        # ------------------------------------------------------------------
+        # invoice.payment_failed
+        # Stripe has retried automatically and all retries are exhausted.
+        # Notify the user to update their payment method.
+        # ------------------------------------------------------------------
+        elif event.type == "invoice.payment_failed":
             invoice = event.data.object
             subscription_id = invoice.subscription
             
             if subscription_id:
-                print(f"🔄 Webhook: Processing renewal for subscription {subscription_id}")
+                user = db.query(User).filter(
+                    User.stripe_subscription_id == subscription_id
+                ).first()
                 
-                # Update user and subscription record
-                user = db.query(User).filter(User.stripe_subscription_id == subscription_id).first()
                 if user:
-                    # Get subscription period from Stripe
-                    stripe_sub = stripe.Subscription.retrieve(subscription_id)
-                    end_date = datetime.fromtimestamp(stripe_sub.current_period_end)
-                    
-                    user.subscription_status = "active"
-                    user.subscription_expires_at = end_date
-                    
-                    # Log the historical record
-                    new_sub = Subscriptions(
+                    NotificationService.create_notification(
+                        db=db,
                         user_id=user.id,
-                        subscription_plan=user.subscription_plan,
-                        transaction_id=invoice.payment_intent,
-                        tx_ref=f"RENEW-{user.id}-{datetime.utcnow().strftime('%Y%m%d')}",
-                        amount=Decimal(str(invoice.amount_paid / 100)),
-                        currency=invoice.currency.upper(),
-                        status="completed",
-                        subscription_status="active",
-                        payment_provider="stripe",
-                        start_date=datetime.fromtimestamp(stripe_sub.current_period_start),
-                        end_date=end_date
+                        type=NotificationType.PAYMENT_FAILED.value,
+                        title="Payment Failed",
+                        message="Your subscription payment failed. Please update your payment method to keep access.",
+                        link="/dashboard/upgrade"
                     )
-                    db.add(new_sub)
-                    
-                    # Handle commission for renewal if needed
-                    from subscriptions.commission_service import CommissionService
-                    CommissionService.calculate_commission(subscription=new_sub, db=db)
-                    
                     db.commit()
-                    print(f"✅ Webhook: Subscription renewal processed for user {user.id}")
-
+                    logger.warning(f"⚠️ Payment failed for user {user.id}, subscription {subscription_id}")
+        
+        # ------------------------------------------------------------------
+        # customer.subscription.deleted
+        # Subscription fully cancelled — revoke access.
+        # ------------------------------------------------------------------
+        elif event.type == "customer.subscription.deleted":
+            stripe_sub = event.data.object
+            subscription_id = stripe_sub.id
+            
+            user = db.query(User).filter(
+                User.stripe_subscription_id == subscription_id
+            ).first()
+            
+            if user:
+                user.subscription_status = "cancelled"
+                if hasattr(user, 'stripe_subscription_id'):
+                    user.stripe_subscription_id = None
+                
+                sub_record = db.query(Subscriptions).filter(
+                    Subscriptions.user_id == user.id,
+                    Subscriptions.subscription_status == "active"
+                ).first()
+                if sub_record:
+                    sub_record.subscription_status = "cancelled"
+                    sub_record.status = "cancelled"
+                
+                NotificationService.create_notification(
+                    db=db,
+                    user_id=user.id,
+                    type="subscription_cancelled",
+                    title="Subscription Cancelled",
+                    message="Your subscription has been cancelled. You can resubscribe at any time.",
+                    link="/dashboard/upgrade"
+                )
+                db.commit()
+                logger.info(f"✅ Subscription cancelled for user {user.id}")
+        
+        # ------------------------------------------------------------------
+        # customer.subscription.updated
+        # Status change: active → past_due, past_due → active (after retry), etc.
+        # ------------------------------------------------------------------
+        elif event.type == "customer.subscription.updated":
+            stripe_sub = event.data.object
+            subscription_id = stripe_sub.id
+            new_status = stripe_sub.status
+            
+            user = db.query(User).filter(
+                User.stripe_subscription_id == subscription_id
+            ).first()
+            
+            if user:
+                status_map = {
+                    "active": "active",
+                    "past_due": "past_due",
+                    "unpaid": "unpaid",
+                    "canceled": "cancelled",
+                    "trialing": "active"
+                }
+                mapped = status_map.get(new_status)
+                if mapped and hasattr(user, 'subscription_status'):
+                    user.subscription_status = mapped
+                db.commit()
+                logger.info(f"✅ Subscription status updated to '{new_status}' for user {user.id}")
+        
+        # ------------------------------------------------------------------
+        # payment_intent.succeeded (LEGACY ONLY)
+        # Only handle PaymentIntents created by the old create-payment-intent
+        # endpoint (flagged with legacy_payment_intent=true in metadata).
+        # New subscription flows use invoice.payment_succeeded instead.
+        # ------------------------------------------------------------------
+        elif event.type == "payment_intent.succeeded":
+            payment_intent = event.data.object
+            metadata = payment_intent.metadata or {}
+            
+            # Skip if this PI belongs to a subscription invoice (Stripe creates PIs for those too)
+            if not metadata.get("legacy_payment_intent"):
+                return {"status": "success"}
+            
+            existing = db.query(Subscriptions).filter(
+                Subscriptions.transaction_id == payment_intent.id
+            ).first()
+            
+            if existing:
+                if existing.status != "completed":
+                    existing.status = "completed"
+                    db.commit()
+                return {"status": "success"}
+            
+            user_id = int(metadata.get("user_id", 0))
+            plan_type = metadata.get("plan_type", "monthly")
+            tx_ref = metadata.get("tx_ref", generate_tx_ref("STRIPE"))
+            
+            if user_id:
+                start = datetime.utcnow()
+                delta_map = {"monthly": 30, "quarterly": 90, "yearly": 365}
+                end = start + timedelta(days=delta_map.get(plan_type, 30))
+                
+                subscription = Subscriptions(
+                    user_id=user_id,
+                    subscription_plan=plan_type,
+                    transaction_id=payment_intent.id,
+                    tx_ref=tx_ref,
+                    amount=Decimal(str(payment_intent.amount / 100)),
+                    currency=payment_intent.currency.upper(),
+                    status="completed",
+                    subscription_status="active",
+                    payment_provider="stripe",
+                    start_date=start,
+                    end_date=end
+                )
+                db.add(subscription)
+                db.flush()
+                
+                user = db.query(User).filter(User.id == user_id).first()
+                if user:
+                    if hasattr(user, 'subscription_status'):
+                        user.subscription_status = "active"
+                    if hasattr(user, 'subscription_plan'):
+                        user.subscription_plan = plan_type
+                    if hasattr(user, 'subscription_expires_at'):
+                        user.subscription_expires_at = end
+                
+                from subscriptions.commission_service import CommissionService
+                CommissionService.calculate_commission(subscription=subscription, db=db)
+                db.commit()
+                logger.info(f"✅ Legacy payment processed for user {user_id}")
+        
+        # Payout events (unchanged)
         elif event.type == "payout.paid":
             handle_payout_paid(event, db)
-            
-        elif event.type == "payout.failed" or event.type == "payout.canceled":
+        elif event.type in ("payout.failed", "payout.canceled"):
             handle_payout_failed(event, db)
         
         return {"status": "success"}
         
     except stripe.error.SignatureVerificationError as e:
-        print(f"❌ Webhook signature verification failed: {str(e)}")
-        # Log specific details about headers if needed (careful with PII)
+        logger.error(f"❌ Webhook signature verification failed: {str(e)}")
         raise HTTPException(status_code=400, detail="Invalid webhook signature")
     except Exception as e:
-        print(f"❌ Webhook error [{event.type if 'event' in locals() else 'unknown'}]: {str(e)}")
+        event_type = event.type if 'event' in locals() else 'unknown'
+        logger.error(f"❌ Webhook error [{event_type}]: {str(e)}")
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(e))
 
 
 def handle_payout_paid(event: dict, db: Session):
-    """
-    Handle successful Stripe Connect payout.
-    Standardized to handle both sync and async flows.
-    """
     stripe_payout = event.data.object
     metadata = stripe_payout.get("metadata", {})
     internal_payout_id = metadata.get("stripe_connect_payout_id")
-
     if not internal_payout_id:
         return
-
     from db.pg_models import Payout
-    from subscriptions.payout_service import PayoutService 
-
+    from subscriptions.payout_service import PayoutService
     payout = db.query(Payout).get(internal_payout_id)
-    if not payout:
-        print(f"⚠️ Webhook: Payout {internal_payout_id} not found")
+    if not payout or payout.status == "completed":
         return
-
-    # If already completed (e.g. via sync flow), do nothing
-    if payout.status == "completed":
-        print(f"ℹ️ Webhook: Stripe payout {payout.id} already completed (idempotent)")
-        return
-
-    # Use specialized service method for completion
-    # Pass background_tasks=None as we already sent the success email during initiation
     from fastapi import BackgroundTasks
-    bg = BackgroundTasks() # Empty bg tasks to avoid double emails
-    PayoutService.complete_stripe_payout(payout.id, bg, "paid", db)
-
-    print(f"✅ Webhook: Stripe payout {payout.id} finalized successfully")
+    PayoutService.complete_stripe_payout(payout.id, BackgroundTasks(), "paid", db)
 
 
 def handle_payout_failed(event: dict, db: Session):
-    """
-    Handle failed Stripe Connect payout.
-    Reverses accounting using PayoutService logic.
-    """
     stripe_payout = event.data.object
     metadata = stripe_payout.get("metadata", {})
     internal_payout_id = metadata.get("stripe_connect_payout_id")
-
     if not internal_payout_id:
         return
-
     from subscriptions.payout_service import PayoutService
-    
-    failure_reason = stripe_payout.get("failure_message") or "Stripe payout failed / Bank rejection"
-    
-    # Use centralized reversal logic
+    failure_reason = stripe_payout.get("failure_message") or "Stripe payout failed"
     PayoutService.reverse_payout(internal_payout_id, failure_reason, db)
 
-    print(f"❌ Webhook: Stripe payout {internal_payout_id} reversed/failed: {failure_reason}")
 
-
-@router.get("/subscription/{user_id}")
-async def get_user_subscription(
-    user_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    Get user's active subscription
-    """
-    # Handle different types of current_user
-    if isinstance(current_user, dict):
-        # Extract user_id from nested structure
-        if "user" in current_user:
-            user_data = current_user["user"]
-            if isinstance(user_data, dict):
-                current_user_id = user_data.get("id") or user_data.get("user_id")
-            elif hasattr(user_data, 'id'):
-                current_user_id = user_data.id
-            else:
-                current_user_id = user_data
-        else:
-            current_user_id = current_user.get("id") or current_user.get("user_id") or current_user.get("sub")
-        
-        if current_user_id is None:
-            raise HTTPException(status_code=500, detail="Could not extract user_id from token")
-    else:
-        current_user_id = current_user.id
-    
-    # Verify the user_id matches (convert to int for comparison)
-    if int(user_id) != int(current_user_id):
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    
-    subscription = db.query(Subscriptions).filter(
-        Subscriptions.user_id == user_id,
-        Subscriptions.status == "completed",
-        Subscriptions.end_date > datetime.utcnow()
-    ).order_by(Subscriptions.created_at.desc()).first()
-    
-    if not subscription:
-        return {"message": "No active subscription found"}
-    
-    return subscription
-
+# ---------------------------------------------------------------------------
+# CREATE SUBSCRIPTION WITH SAVED CARD (primary post-launch flow)
+# ---------------------------------------------------------------------------
 
 @router.post("/create-subscription-with-saved-card")
 async def create_subscription_with_saved_card(
@@ -823,105 +935,87 @@ async def create_subscription_with_saved_card(
     db: Session = Depends(get_db)
 ):
     """
-    NEW ENDPOINT: Create subscription with saved payment method
-    This replaces the old create-payment-intent flow for subscriptions
+    Create a Stripe Subscription using an existing payment method.
+    
+    This is the PRIMARY subscription endpoint for post-launch users.
+    Unlike the legacy /create-payment-intent, this creates a real Stripe
+    Subscription (sub_xxx) that:
+    - Appears in Stripe Dashboard → Subscriptions
+    - Auto-renews at each billing cycle
+    - Fires invoice.payment_succeeded on every renewal
+    - Supports Test Clock simulation for renewal testing
+    
+    Flow:
+    1. Get or create Stripe Customer
+    2. Attach payment method as customer default
+    3. Create subscription via stripe.Subscription.create()
+    4. If card requires 3DS: return requires_action + client_secret
+    5. Frontend calls stripe.confirmCardPayment(client_secret)
+    6. Frontend calls POST /confirm-subscription to finalise DB record
+    7. If no 3DS: subscription is active immediately, DB record created here
     """
     try:
-        # Extract user_id (your existing logic)
-        if isinstance(current_user, dict):
-            if "user" in current_user:
-                user_data = current_user["user"]
-                if isinstance(user_data, dict):
-                    user_id = user_data.get("id") or user_data.get("user_id")
-                elif hasattr(user_data, 'id'):
-                    user_id = user_data.id
-                else:
-                    user_id = user_data
-            else:
-                user_id = current_user.get("id") or current_user.get("user_id") or current_user.get("sub")
-            
-            if user_id is None:
-                raise HTTPException(status_code=500, detail="Could not extract user_id from token")
-        else:
-            user_id = current_user.id
-        
-        # Get user from database
+        user_id = extract_user_id(current_user)
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         
-        # Validate plan type
         price_id = get_stripe_price_id(request.plan_type)
         if not price_id:
             raise HTTPException(
-                status_code=400, 
-                detail=f"Price ID not configured or invalid plan type for: {request.plan_type}. Please set STRIPE_{request.plan_type.upper()}_PRICE_ID in environment."
+                status_code=400,
+                detail=f"Price ID not configured for plan: {request.plan_type}. "
+                       f"Set STRIPE_{request.plan_type.upper()}_PRICE_ID in environment."
             )
         
-        # Get or create Stripe customer
-        stripe_customer_id = user.stripe_customer_id if hasattr(user, 'stripe_customer_id') else None
         customer_id = StripeService.get_or_create_customer(
             user_id=user_id,
             email=user.email,
             name=user.name,
-            stripe_customer_id=stripe_customer_id
+            stripe_customer_id=getattr(user, 'stripe_customer_id', None)
         )
         
-        # Update user with customer ID if new
-        if not stripe_customer_id and hasattr(user, 'stripe_customer_id'):
+        if not getattr(user, 'stripe_customer_id', None) and hasattr(user, 'stripe_customer_id'):
             user.stripe_customer_id = customer_id
             db.commit()
         
-        # Attach payment method to customer
         StripeService.attach_payment_method(
             payment_method_id=request.payment_method_id,
             customer_id=customer_id,
             set_as_default=True
         )
         
-        # Check for existing active subscription
-        if hasattr(user, 'stripe_subscription_id') and user.stripe_subscription_id:
+        # Check for existing active subscription — upgrade/downgrade instead of creating new
+        existing_stripe_sub_id = getattr(user, 'stripe_subscription_id', None)
+        if existing_stripe_sub_id:
             try:
-                existing_sub = StripeService.retrieve_subscription(user.stripe_subscription_id)
+                existing_sub = StripeService.retrieve_subscription(existing_stripe_sub_id)
                 if existing_sub["status"] == "active":
-                    # Update existing subscription to new plan
                     updated_sub = StripeService.update_subscription_price(
-                        subscription_id=user.stripe_subscription_id,
+                        subscription_id=existing_stripe_sub_id,
                         new_price_id=price_id,
                         prorate=True
                     )
-                    
-                    # Update database
-                    subscription = db.query(Subscriptions).filter(
+                    sub_record = db.query(Subscriptions).filter(
                         Subscriptions.user_id == user_id,
                         Subscriptions.subscription_status == "active"
                     ).first()
-                    
-                    if subscription:
-                        subscription.subscription_plan = request.plan_type
-                        # Safely handle potential None for current_period_end
+                    if sub_record:
+                        sub_record.subscription_plan = request.plan_type
                         period_end = updated_sub.get("current_period_end")
                         if period_end:
-                            subscription.end_date = datetime.fromtimestamp(period_end)
-                        else:
-                            # Fallback if Stripe doesn't return the period end
-                            _, end_date = calculate_subscription_dates(request.plan_type)
-                            subscription.end_date = end_date
+                            sub_record.end_date = datetime.fromtimestamp(period_end)
                         db.commit()
-                    
                     return {
-                        "status": "success",
+                        "status": "active",
                         "subscription_id": updated_sub["id"],
                         "message": "Subscription updated successfully"
                     }
-            except:
-                # Subscription doesn't exist or is invalid, create new one
-                pass
+            except Exception:
+                pass  # Subscription invalid/expired — create a new one
         
-        # Generate transaction reference
         tx_ref = generate_tx_ref("STRIPE-SUB")
         
-        # Create new subscription
         subscription_result = StripeService.create_subscription_with_saved_card(
             customer_id=customer_id,
             price_id=price_id,
@@ -933,44 +1027,25 @@ async def create_subscription_with_saved_card(
             }
         )
         
-        # Handling subscription result
-        print(f"📊 Subscription result: {subscription_result}")
-        print(f"📊 Status: {subscription_result.get('status')}")
-        print(f"📊 Subscription ID: {subscription_result.get('subscription_id')}")
-
-        # Handle subscription status
         if subscription_result["status"] == "active":
-            print(f"✅ Subscription is ACTIVE - creating database record...")
+            # Use Stripe's period dates — not local timedelta
+            start_date, end_date = get_subscription_dates_from_stripe(subscription_result, request.plan_type)
             
-            # Subscription is active, create database record
-            start_date, end_date = calculate_subscription_dates(request.plan_type)
+            # Idempotency
+            if db.query(Subscriptions).filter(
+                Subscriptions.transaction_id == subscription_result["subscription_id"]
+            ).first():
+                return {"status": "active", "subscription_id": subscription_result["subscription_id"]}
             
-            # Get pricing from settings
             from api.routes.control.settings import get_settings
             settings = get_settings(db=db, current_user=user)
+            price_map = {
+                "monthly": settings.monthly_price,
+                "quarterly": settings.quarterly_price,
+                "yearly": settings.yearly_price
+            }
+            amount = price_map.get(request.plan_type, 29.95)
             
-            if request.plan_type == "monthly":
-                amount = settings.monthly_price
-            elif request.plan_type == "quarterly":
-                amount = settings.quarterly_price
-            else:
-                amount = settings.yearly_price
-            
-            # Check if subscription already exists in database (idempotency)
-            existing_subscription = db.query(Subscriptions).filter(
-                Subscriptions.user_id == user_id,
-                Subscriptions.transaction_id == subscription_result["subscription_id"]
-            ).first()
-            
-            if existing_subscription:
-                print(f"ℹ️  Subscription already exists in database: {existing_subscription.id}")
-                return {
-                    "status": "active",
-                    "subscription_id": subscription_result["subscription_id"],
-                    "subscription": existing_subscription
-                }
-            
-            # Create new subscription record
             subscription = Subscriptions(
                 user_id=user_id,
                 subscription_plan=request.plan_type,
@@ -984,13 +1059,9 @@ async def create_subscription_with_saved_card(
                 start_date=start_date,
                 end_date=end_date
             )
-            
             db.add(subscription)
             db.flush()
             
-            print(f"✅ Database subscription record created: ID {subscription.id}")
-            
-            # Update user
             if hasattr(user, 'subscription_status'):
                 user.subscription_status = "active"
             if hasattr(user, 'subscription_plan'):
@@ -1000,49 +1071,42 @@ async def create_subscription_with_saved_card(
             if hasattr(user, 'stripe_subscription_id'):
                 user.stripe_subscription_id = subscription_result["subscription_id"]
             
-            print(f"✅ User record updated")
+            # Save card details to user record
+            try:
+                pm = stripe.PaymentMethod.retrieve(request.payment_method_id)
+                user.stripe_payment_method_id = request.payment_method_id
+                user.card_last4 = pm.card.last4
+                user.card_brand = pm.card.brand
+                user.card_exp_month = pm.card.exp_month
+                user.card_exp_year = pm.card.exp_year
+                user.card_saved_at = datetime.utcnow()
+            except Exception as card_err:
+                logger.warning(f"⚠️ Could not save card details: {str(card_err)}")
             
-            # Calculate commission
             from subscriptions.commission_service import CommissionService
-            commission = CommissionService.calculate_commission(subscription=subscription, db=db)
-            
-            if commission:
-                print(f"✅ Commission created: ${commission.amount}")
+            CommissionService.calculate_commission(subscription=subscription, db=db)
             
             db.commit()
             db.refresh(subscription)
             
-            print(f"✅ Transaction committed to database")
-            
-            # Send success email
             background_tasks.add_task(
                 email_service.send_payment_success_email,
-                user.email,
-                user.name,
-                float(amount),
-                request.plan_type,
-                end_date.strftime("%B %d, %Y")
+                user.email, user.name, float(amount),
+                request.plan_type, end_date.strftime("%B %d, %Y")
             )
-            
-            print(f"✅ Success email queued")
             
             return {
                 "status": "active",
                 "subscription_id": subscription_result["subscription_id"],
                 "subscription": subscription
             }
-            
+        
         elif subscription_result["status"] == "incomplete":
-            print(f"⚠️  Subscription INCOMPLETE - requires 3D Secure authentication")
-            
-            # Requires additional authentication (3D Secure)
             if not subscription_result.get("client_secret"):
-                print(f"❌ ERROR: Subscription requires action but client_secret is missing.")
                 raise HTTPException(
                     status_code=500,
                     detail="Subscription requires authentication but client_secret is missing"
                 )
-            
             return {
                 "status": "requires_action",
                 "subscription_id": subscription_result["subscription_id"],
@@ -1051,7 +1115,6 @@ async def create_subscription_with_saved_card(
                 "message": "Additional authentication required"
             }
         else:
-            print(f"❌ Unexpected subscription status: {subscription_result['status']}")
             raise HTTPException(
                 status_code=400,
                 detail=f"Subscription creation failed with status: {subscription_result['status']}"
@@ -1062,23 +1125,19 @@ async def create_subscription_with_saved_card(
         raise
     except stripe.error.StripeError as e:
         db.rollback()
-        # Notify user of failure (payment specific)
         NotificationService.create_notification(
-            db=db,
-            user_id=user_id,
+            db=db, user_id=user_id,
             type=NotificationType.PAYMENT_FAILED.value,
             title="Payment Failed",
             message=f"Your subscription payment failed: {str(e)}",
             link="/dashboard/upgrade"
         )
-        print(f"Stripe Payment Error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         db.rollback()
-        print(f"Unexpected Subscription creation error: {str(e)}")
-        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(e))
+
 
 @router.post("/confirm-subscription")
 async def confirm_subscription(
@@ -1088,74 +1147,76 @@ async def confirm_subscription(
     db: Session = Depends(get_db)
 ):
     """
-    Confirm subscription after 3D Secure authentication
+    Finalise a subscription after 3D Secure authentication.
+    
+    Called by the frontend after stripe.confirmCardPayment() succeeds.
+    Creates or updates the DB record for the now-active subscription.
     """
     try:
-        # Extract user_id (your existing logic)
-        if isinstance(current_user, dict):
-            if "user" in current_user:
-                user_data = current_user["user"]
-                if isinstance(user_data, dict):
-                    user_id = user_data.get("id") or user_data.get("user_id")
-                elif hasattr(user_data, 'id'):
-                    user_id = user_data.id
-                else:
-                    user_id = user_data
-            else:
-                user_id = current_user.get("id") or current_user.get("user_id") or current_user.get("sub")
-        else:
-            user_id = current_user.id
+        user_id = extract_user_id(current_user)
         
-        # Verify payment intent
         verification = StripeService.verify_payment(request.payment_intent_id)
-        
         if verification["status"] != "succeeded":
             raise HTTPException(
                 status_code=400,
                 detail=f"Payment not successful. Status: {verification['status']}"
             )
         
-        # Get subscription details to get current_period_end
         subscription_details = StripeService.retrieve_subscription(request.subscription_id)
         
-        if subscription_details["status"] == "active":
-            # Extract metadata from payment intent
-            metadata = verification.get("metadata", {})
-            plan_type = metadata.get("plan_type", "monthly")
-            tx_ref = metadata.get("tx_ref", generate_tx_ref("STRIPE-SUB"))
-            
-            # Use subscription period from Stripe or fallback
-            period_start = subscription_details.get("current_period_start")
-            period_end = subscription_details.get("current_period_end")
-            
-            if period_start is not None and period_end is not None:
-                try:
-                    start_date = datetime.fromtimestamp(int(period_start))
-                    end_date = datetime.fromtimestamp(int(period_end))
-                except (ValueError, TypeError) as e:
-                    print(f"⚠️ Error parsing Stripe timestamps: {str(e)}. Falling back to manual calculation.")
-                    start_date, end_date = calculate_subscription_dates(plan_type)
-            else:
-                # Fallback: calculate manually if Stripe data is incomplete
-                print(f"ℹ️  Stripe period data incomplete or None, calculating manually for {plan_type}")
-                start_date, end_date = calculate_subscription_dates(plan_type)
-            
-            # Get pricing
-            from api.routes.control.settings import get_settings
-            user = db.query(User).filter(User.id == user_id).first()
-            settings = get_settings(db=db, current_user=user)
-            
-            if plan_type == "monthly":
-                amount = settings.monthly_price
-            elif plan_type == "quarterly":
-                amount = settings.quarterly_price
-            else:
-                amount = settings.yearly_price
-            
+        if subscription_details["status"] != "active":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Subscription not active. Status: {subscription_details['status']}"
+            )
+        
+        # Read plan_type from the Subscription metadata — NOT the PaymentIntent metadata.
+        # Stripe does NOT copy subscription metadata onto the auto-generated PaymentIntent,
+        # so reading from verification.metadata always returns None and falls back to
+        # "monthly" regardless of what the user actually chose.
+        # retrieve_subscription() now returns plan_type from subscription.metadata directly.
+        plan_type = (
+            subscription_details.get("plan_type")          # from subscription metadata ✅
+            or verification.get("metadata", {}).get("plan_type")  # PI metadata fallback
+            or (user.subscription_plan if db.query(User).filter(User.id == user_id).first() else None)
+            or "monthly"                                    # last resort default
+        )
+
+        # tx_ref: try subscription metadata first, then PI metadata
+        sub_metadata = {}
+        tx_ref = sub_metadata.get("tx_ref") or verification.get("metadata", {}).get("tx_ref") or generate_tx_ref("STRIPE-SUB")
+
+        logger.info(f"confirm-subscription: plan_type='{plan_type}' for sub {request.subscription_id}")
+
+        # Use Stripe's period dates
+        start_date, end_date = get_subscription_dates_from_stripe(subscription_details, plan_type)
+        
+        from api.routes.control.settings import get_settings
+        user = db.query(User).filter(User.id == user_id).first()
+        settings = get_settings(db=db, current_user=user)
+        price_map = {
+            "monthly": settings.monthly_price,
+            "quarterly": settings.quarterly_price,
+            "yearly": settings.yearly_price
+        }
+        amount = price_map.get(plan_type, 29.95)
+        
+        # Update existing record if one was created during the incomplete flow
+        existing = db.query(Subscriptions).filter(
+            Subscriptions.transaction_id == request.subscription_id
+        ).first()
+        
+        if existing:
+            existing.subscription_status = "active"
+            existing.status = "completed"
+            existing.end_date = end_date
+            existing.start_date = start_date
+            subscription = existing
+        else:
             subscription = Subscriptions(
                 user_id=user_id,
                 subscription_plan=plan_type,
-                transaction_id=request.subscription_id,  # Use subscription_id, not payment_intent_id
+                transaction_id=request.subscription_id,
                 tx_ref=tx_ref,
                 amount=Decimal(str(amount)),
                 currency="USD",
@@ -1165,60 +1226,67 @@ async def confirm_subscription(
                 start_date=start_date,
                 end_date=end_date
             )
-            
             db.add(subscription)
-            db.flush()
+        
+        db.flush()
+        
+        if user:
+            if hasattr(user, 'subscription_status'):
+                user.subscription_status = "active"
+            if hasattr(user, 'subscription_plan'):
+                user.subscription_plan = plan_type
+            if hasattr(user, 'subscription_expires_at'):
+                user.subscription_expires_at = end_date
+            if hasattr(user, 'stripe_subscription_id'):
+                user.stripe_subscription_id = request.subscription_id
             
-            # Update user
-            if user:
-                if hasattr(user, 'subscription_status'):
-                    user.subscription_status = "active"
-                if hasattr(user, 'subscription_plan'):
-                    user.subscription_plan = plan_type
-                if hasattr(user, 'subscription_expires_at'):
-                    user.subscription_expires_at = end_date
-                if hasattr(user, 'stripe_subscription_id'):
-                    user.stripe_subscription_id = request.subscription_id
-            
-            # Calculate commission
+            # Save card details from the payment intent if not already stored
+            try:
+                pm_id = verification.get("payment_method")
+                if pm_id and not getattr(user, 'stripe_payment_method_id', None):
+                    pm = stripe.PaymentMethod.retrieve(pm_id)
+                    user.stripe_payment_method_id = pm_id
+                    user.card_last4 = pm.card.last4
+                    user.card_brand = pm.card.brand
+                    user.card_exp_month = pm.card.exp_month
+                    user.card_exp_year = pm.card.exp_year
+                    user.card_saved_at = datetime.utcnow()
+            except Exception as card_err:
+                logger.warning(f"⚠️ Could not save card details: {str(card_err)}")
+        
+        if not existing:
             from subscriptions.commission_service import CommissionService
-            commission = CommissionService.calculate_commission(subscription=subscription, db=db)
-            
-            db.commit()
-            db.refresh(subscription)
-            
-            # Send success email
-            if user:
-                background_tasks.add_task(
-                    email_service.send_payment_success_email,
-                    user.email,
-                    user.name,
-                    float(amount),
-                    plan_type,
-                    end_date.strftime("%B %d, %Y")
-                )
-            
-            return {
-                "status": "success",
-                "subscription": subscription
-            }
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Subscription status: {subscription_details['status']}"
+            CommissionService.calculate_commission(subscription=subscription, db=db)
+        
+        db.commit()
+        db.refresh(subscription)
+        
+        if user:
+            background_tasks.add_task(
+                email_service.send_payment_success_email,
+                user.email, user.name, float(amount),
+                plan_type, end_date.strftime("%B %d, %Y")
             )
-
+        
+        NotificationService.create_notification(
+            db=db,
+            user_id=user_id,
+            type="subscription_active",
+            title="✅ Subscription Activated",
+            message=f"Your subscription is now active! Thank you for joining Lavoo. Your access is valid until {end_date.strftime('%B %d, %Y')}.",
+            link="/dashboard"
+        )
+        
+        return {"status": "success", "subscription": subscription}
+        
     except HTTPException:
         db.rollback()
         raise
     except stripe.error.StripeError as e:
         db.rollback()
-        print(f"Stripe Subscription Confirmation Error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         db.rollback()
-        print(f"Unexpected Subscription Confirmation Error: {str(e)}")
-        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1229,56 +1297,33 @@ async def cancel_subscription_endpoint(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Cancel user's subscription
-    """
+    """Cancel user's subscription. Defaults to cancelling at period end."""
     try:
-        # Extract user_id
-        if isinstance(current_user, dict):
-            if "user" in current_user:
-                user_data = current_user["user"]
-                if isinstance(user_data, dict):
-                    user_id = user_data.get("id") or user_data.get("user_id")
-                elif hasattr(user_data, 'id'):
-                    user_id = user_data.id
-                else:
-                    user_id = user_data
-            else:
-                user_id = current_user.get("id") or current_user.get("user_id") or current_user.get("sub")
-        else:
-            user_id = current_user.id
-        
+        user_id = extract_user_id(current_user)
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-        
-        if not hasattr(user, 'stripe_subscription_id') or not user.stripe_subscription_id:
+        if not getattr(user, 'stripe_subscription_id', None):
             raise HTTPException(status_code=404, detail="No active subscription found")
         
-        # Cancel in Stripe
         result = StripeService.cancel_subscription(
             subscription_id=user.stripe_subscription_id,
             at_period_end=at_period_end
         )
         
-        # Update database
-        subscription = db.query(Subscriptions).filter(
+        sub_record = db.query(Subscriptions).filter(
             Subscriptions.user_id == user_id,
             Subscriptions.subscription_status == "active"
         ).first()
-        
-        if subscription:
-            if at_period_end:
-                subscription.subscription_status = "canceling"
-            else:
-                subscription.subscription_status = "cancelled"
-                subscription.status = "cancelled"
+        if sub_record:
+            sub_record.subscription_status = "canceling" if at_period_end else "cancelled"
+            if not at_period_end:
+                sub_record.status = "cancelled"
         
         if hasattr(user, 'subscription_status'):
             user.subscription_status = "canceling" if at_period_end else "cancelled"
         
         db.commit()
-        
         return {
             "status": "success",
             "message": "Subscription cancelled" + (" at period end" if at_period_end else " immediately"),
@@ -1299,43 +1344,21 @@ async def update_payment_method(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Update default payment method for subscriptions
-    """
+    """Update the default payment method for a customer's subscriptions."""
     try:
-        # Extract user_id
-        if isinstance(current_user, dict):
-            if "user" in current_user:
-                user_data = current_user["user"]
-                if isinstance(user_data, dict):
-                    user_id = user_data.get("id") or user_data.get("user_id")
-                elif hasattr(user_data, 'id'):
-                    user_id = user_data.id
-                else:
-                    user_id = user_data
-            else:
-                user_id = current_user.get("id") or current_user.get("user_id") or current_user.get("sub")
-        else:
-            user_id = current_user.id
-        
+        user_id = extract_user_id(current_user)
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-        
-        if not hasattr(user, 'stripe_customer_id') or not user.stripe_customer_id:
+        if not getattr(user, 'stripe_customer_id', None):
             raise HTTPException(status_code=404, detail="No Stripe customer found")
         
-        # Attach new payment method
         StripeService.attach_payment_method(
             payment_method_id=request.payment_method_id,
             customer_id=user.stripe_customer_id,
             set_as_default=True
         )
-        
-        return {
-            "status": "success",
-            "message": "Payment method updated successfully"
-        }
+        return {"status": "success", "message": "Payment method updated successfully"}
     
     except HTTPException:
         raise
@@ -1348,40 +1371,42 @@ async def get_payment_methods(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Get user's saved payment methods
-    """
+    """Get all saved payment methods for the current user."""
     try:
-        # Extract user_id
-        if isinstance(current_user, dict):
-            if "user" in current_user:
-                user_data = current_user["user"]
-                if isinstance(user_data, dict):
-                    user_id = user_data.get("id") or user_data.get("user_id")
-                elif hasattr(user_data, 'id'):
-                    user_id = user_data.id
-                else:
-                    user_id = user_data
-            else:
-                user_id = current_user.get("id") or current_user.get("user_id") or current_user.get("sub")
-        else:
-            user_id = current_user.id
-        
+        user_id = extract_user_id(current_user)
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-        
-        if not hasattr(user, 'stripe_customer_id') or not user.stripe_customer_id:
+        if not getattr(user, 'stripe_customer_id', None):
             return {"payment_methods": []}
-        
         payment_methods = StripeService.get_customer_payment_methods(user.stripe_customer_id)
-        
         return {"payment_methods": payment_methods}
-    
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/subscription/{user_id}")
+async def get_user_subscription(
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get a user's active subscription record."""
+    current_user_id = extract_user_id(current_user)
+    if user_id != current_user_id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    
+    subscription = db.query(Subscriptions).filter(
+        Subscriptions.user_id == user_id,
+        Subscriptions.status == "completed",
+        Subscriptions.end_date > datetime.utcnow()
+    ).order_by(Subscriptions.created_at.desc()).first()
+    
+    if not subscription:
+        return {"message": "No active subscription found"}
+    return subscription
 
 
 @router.post("/remove-card")
@@ -1389,39 +1414,20 @@ async def remove_card(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Remove user's saved card
-    """
+    """Remove the user's saved card from Stripe and clear local record."""
     try:
-        # Extract user_id
-        if isinstance(current_user, dict):
-            if "user" in current_user:
-                user_data = current_user["user"]
-                if isinstance(user_data, dict):
-                    user_id = user_data.get("id") or user_data.get("user_id")
-                elif hasattr(user_data, 'id'):
-                    user_id = user_data.id
-                else:
-                    user_id = user_data
-            else:
-                user_id = current_user.get("id") or current_user.get("user_id") or current_user.get("sub")
-        else:
-            user_id = current_user.id
-            
+        user_id = extract_user_id(current_user)
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-            
-        if not hasattr(user, 'stripe_payment_method_id') or not user.stripe_payment_method_id:
-            raise HTTPException(status_code=400, detail="No saved card found to remove")
-            
-        # Detach from Stripe
+        if not getattr(user, 'stripe_payment_method_id', None):
+            raise HTTPException(status_code=400, detail="No saved card found")
+        
         try:
             StripeService.detach_payment_method(user.stripe_payment_method_id)
         except Exception as e:
-            print(f"⚠️ Warning: Could not detach from Stripe (might already be detached): {str(e)}")
-            
-        # Clear database fields
+            logger.warning(f"⚠️ Could not detach from Stripe (may already be detached): {str(e)}")
+        
         user.stripe_payment_method_id = None
         user.card_last4 = None
         user.card_brand = None
@@ -1430,17 +1436,11 @@ async def remove_card(
         user.card_saved_at = None
         
         db.commit()
-        
-        return {
-            "status": "success",
-            "message": "Card removed successfully"
-        }
+        return {"status": "success", "message": "Card removed successfully"}
         
     except HTTPException:
         db.rollback()
         raise
     except Exception as e:
         db.rollback()
-        print(f"Error removing card: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
-

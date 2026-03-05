@@ -1,9 +1,10 @@
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
 import os
 from sqlalchemy.orm import Session
 from db.pg_models import User
+from dotenv import dotenv_values
 
 class BetaService:
     
@@ -11,35 +12,70 @@ class BetaService:
     def get_app_mode() -> str:
         """
         Get current application mode: 'beta', 'launch', or 'development'
-        Reads from APP_MODE env var, fallbacks to BETA_MODE.
+        Reads dynamically from .env to pick up changes without restarting,
+        fallbacks to os.getenv.
         """
-        mode = os.getenv("APP_MODE", "").lower()
+        env_vars = dotenv_values(".env")
+        
+        mode = env_vars.get("APP_MODE")
+        if mode is None:
+            mode = os.getenv("APP_MODE", "")
+            
+        mode = str(mode).lower().strip()
         if mode in ["beta", "launch", "development"]:
             return mode
             
         # Legacy support / Fallback
-        if os.getenv("BETA_MODE", "false").lower() == "true":
+        legacy_beta = env_vars.get("BETA_MODE")
+        if legacy_beta is None:
+            legacy_beta = os.getenv("BETA_MODE", "false")
+            
+        if str(legacy_beta).lower().strip() == "true":
             return "beta"
             
         return "launch"
 
     @staticmethod
     def is_beta_mode() -> bool:
-        """Check if system is in beta mode"""
-        return BetaService.get_app_mode() == "beta"
+        """Check if system is in beta mode (or launch mode before launch date)"""
+        mode = BetaService.get_app_mode()
+        if mode == "beta":
+            return True
+            
+        if mode == "launch":
+            launch_date = BetaService.get_launch_date()
+            if launch_date:
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                if now < launch_date:
+                    return True
+                    
+        return False
     
     @staticmethod
     def get_launch_date() -> Optional[datetime]:
-        """Get configured launch date"""
-        launch_str = os.getenv("LAUNCH_DATE")
+        """Get configured launch date (supports DD/MM/YYYY)"""
+        env_vars = dotenv_values(".env")
+        launch_str = env_vars.get("LAUNCH_DATE") or os.getenv("LAUNCH_DATE")
         if launch_str:
-            return datetime.strptime(launch_str, "%Y-%m-%d")
+            try:
+                # Try DD/MM/YYYY first as requested by user
+                return datetime.strptime(launch_str, "%d/%m/%Y")
+            except ValueError:
+                try:
+                    # Fallback to ISO format
+                    return datetime.strptime(launch_str, "%Y-%m-%d")
+                except ValueError:
+                    return None
         return None
     
     @staticmethod
     def get_grace_period_days() -> int:
         """Get grace period duration (default: 5 days)"""
-        return int(os.getenv("GRACE_PERIOD_DAYS", "5"))
+        env_vars = dotenv_values(".env")
+        days = env_vars.get("GRACE_PERIOD_DAYS")
+        if days is None:
+            days = os.getenv("GRACE_PERIOD_DAYS", "5")
+        return int(days)
     
     @staticmethod
     def calculate_grace_period_end(launch_date: datetime) -> datetime:
@@ -48,21 +84,40 @@ class BetaService:
         return launch_date + timedelta(days=grace_days)
     
     @staticmethod
-    def is_in_grace_period() -> bool:
-        """Check if we're currently in grace period"""
+    def is_in_grace_period(user: Optional[User] = None) -> bool:
+        """
+        Check if we're currently in grace period.
+        If user is provided, checks their specific grace period.
+        """
+        # If in beta, we are NOT in grace period yet
         if BetaService.is_beta_mode():
-            return False  # Still in beta, not launched yet
-        
-        launch_date = BetaService.get_launch_date()
-        if not launch_date:
             return False
         
-        # Check if launch has happened
-        if datetime.utcnow() < launch_date:
-            return False  # Launch hasn't happened yet
+        now = datetime.now(timezone.utc).replace(tzinfo=None) # Standardize to naive UTC
+
+        # Check user-specific grace period first
+        if user and user.grace_period_ends_at:
+            grace_end = user.grace_period_ends_at
+            if getattr(user, 'is_beta_user', False):
+                launch_date = BetaService.get_launch_date()
+                if launch_date:
+                    grace_end = BetaService.calculate_grace_period_end(launch_date)
+                    
+            if now < grace_end:
+                return True
         
-        grace_end = BetaService.calculate_grace_period_end(launch_date)
-        return datetime.utcnow() < grace_end
+        # Fallback to global launch date
+        launch_date = BetaService.get_launch_date()
+        if launch_date:
+            # If we have a launch date and it hasn't happened yet, we aren't in grace
+            if now < launch_date:
+                return False
+            
+            grace_end = BetaService.calculate_grace_period_end(launch_date)
+            if now < grace_end:
+                return True
+                
+        return False
     
     @staticmethod
     def has_saved_card(user: User) -> bool:
@@ -87,91 +142,128 @@ class BetaService:
         # BETA PERIOD (Before Launch)
         if BetaService.is_beta_mode():
             if has_card:
+                # Card saved in beta mode - banner hides, billing happens at launch
+                app_mode = BetaService.get_app_mode()
                 return {
                     "status": "beta_with_card",
-                    "message": "You're All Set for Launch!",
+                    "message": "You're all set! Your card is saved and will be billed at launch.",
                     "action_required": False,
-                    "countdown_ends_at": None,
+                    "countdown_ends_at": launch_date if app_mode == "launch" else None,
                     "days_remaining": None,
-                    "show_card_info": True
+                    "show_card_info": True,
+                    "is_beta_user": True
                 }
             else:
+                app_mode = BetaService.get_app_mode()
                 return {
                     "status": "beta_no_card",
-                    "message": "Save Your Card for Launch Access",
+                    "message": "Save your card now to secure your access after the beta period!",
                     "action_required": True,
-                    "countdown_ends_at": None,
+                    "countdown_ends_at": launch_date if app_mode == "launch" else None,
                     "days_remaining": None,
-                    "show_card_info": False
+                    "show_card_info": False,
+                    "is_beta_user": True
                 }
         
         # GRACE PERIOD (Launch Day + 5 Days OR Signup Day + 5 Days)
-        if BetaService.is_in_grace_period() or (user.grace_period_ends_at and datetime.utcnow() < user.grace_period_ends_at):
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        
+        if BetaService.is_in_grace_period(user):
             grace_end = user.grace_period_ends_at
+            is_beta = getattr(user, 'is_beta_user', False)
             
+            # If user has no personal grace end, or if they are a beta user (to ensure .env changes are instantly reflected),
+            # we should calculate it dynamically.
+            if not grace_end or is_beta:
+                 launch_date = BetaService.get_launch_date()
+                 if launch_date:
+                     grace_end = BetaService.calculate_grace_period_end(launch_date)
+
             if not grace_end:
+                 app_mode = BetaService.get_app_mode()
+                 launch_date = BetaService.get_launch_date()
                  return {
                     "status": "new_user",
                     "message": "Subscribe to get started with Lavoo",
                     "action_required": True,
-                    "countdown_ends_at": None,
+                    "countdown_ends_at": launch_date if app_mode == "launch" else None,
                     "days_remaining": None,
                     "show_card_info": False
                 }
 
-            time_remaining = grace_end - datetime.utcnow()
+            time_remaining = grace_end - now
             days_rem = time_remaining.days
             
+            is_beta = getattr(user, 'is_beta_user', False)
             if has_card:
+                # Card saved - banner hides (billing is immediate in launch mode → user becomes active)
                 return {
                     "status": "grace_with_card",
-                    "message": f"Welcome! First charge in {days_rem if days_rem > 0 else 5} days",
+                    "message": "",
                     "action_required": False,
-                    "countdown_ends_at": grace_end,
-                    "days_remaining": days_rem,
-                    "show_card_info": True
+                    "countdown_ends_at": None,
+                    "days_remaining": None,
+                    "show_card_info": True,
+                    "is_beta_user": is_beta
                 }
             else:
+                # No card saved — show the notice with countdown
+                message = (
+                    "Save your card now to secure your access after the beta period!"
+                    if is_beta
+                    else "Subscribe now to keep your access to Lavoo!"
+                )
                 return {
                     "status": "grace_no_card",
-                    "message": "ACTION REQUIRED",
+                    "message": message,
                     "action_required": True,
                     "countdown_ends_at": grace_end,
                     "days_remaining": days_rem,
                     "hours_remaining": (time_remaining.seconds // 3600),
                     "minutes_remaining": (time_remaining.seconds % 3600) // 60,
                     "seconds_remaining": (time_remaining.seconds % 60),
-                    "show_card_info": False
+                    "show_card_info": False,
+                    "is_beta_user": is_beta
                 }
         
         # AFTER GRACE PERIOD OR ACTIVE SUBSCRIPTION
-        if has_card and user.subscription_status == "active":
+        # Check active subscription FIRST — if user paid, no timer needed regardless of card on file
+        if user.subscription_status == "active":
+            days_rem = None
+            if user.subscription_expires_at:
+                 expires_naive = user.subscription_expires_at.replace(tzinfo=None) if user.subscription_expires_at.tzinfo else user.subscription_expires_at
+                 days_rem = (expires_naive - now).days
+
             return {
                 "status": "active",
                 "message": "Your subscription is active",
                 "action_required": False,
                 "countdown_ends_at": user.subscription_expires_at,
-                "days_remaining": (user.subscription_expires_at - datetime.utcnow()).days if user.subscription_expires_at else None,
+                "days_remaining": days_rem,
                 "show_card_info": True
             }
         
         # Pause access if grace period is over and no card/active sub
-        if user.grace_period_ends_at and datetime.utcnow() >= user.grace_period_ends_at:
-             return {
-                "status": "grace_expired_no_card",
-                "message": "Your access is paused. Add a payment method to reactivate.",
-                "action_required": True,
-                "countdown_ends_at": None,
-                "days_remaining": None,
-                "show_card_info": False
-            }
+        if user.grace_period_ends_at:
+             grace_naive = user.grace_period_ends_at.replace(tzinfo=None) if user.grace_period_ends_at.tzinfo else user.grace_period_ends_at
+             if now >= grace_naive:
+                 return {
+                    "status": "grace_expired_no_card",
+                    "message": "Your access is paused. Add a payment method to reactivate.",
+                    "action_required": True,
+                    "countdown_ends_at": None,
+                    "days_remaining": None,
+                    "show_card_info": False
+                }
 
         # NEW USER (No Grace Period set yet)
+        app_mode = BetaService.get_app_mode()
+        launch_date = BetaService.get_launch_date()
         return {
             "status": "new_user",
             "message": "Subscribe to get started with Lavoo",
             "action_required": True,
-            "countdown_ends_at": None,
+            "countdown_ends_at": launch_date if app_mode == "launch" else None,
             "days_remaining": None,
             "show_card_info": False
         }
@@ -211,7 +303,7 @@ class BetaService:
         if launch_date:
             user.grace_period_ends_at = BetaService.calculate_grace_period_end(launch_date)
         
-        db.commit()
+        db.flush()
     
     @staticmethod
     def should_send_reminder(user: User, notification_type: str, db: Session) -> bool:

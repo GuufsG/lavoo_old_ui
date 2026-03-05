@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { toast } from 'react-toastify';
 import StripeCheckoutWithSavedCard from './checkoutForm';
-import { useBetaStatus } from '../../../api/user';
+import { useBetaStatus, useCurrentUser } from '../../../api/user';
 
 export default function UpgradePage() {
   const [selectedPlan, setSelectedPlan] = useState<'monthly' | 'quarterly' | 'yearly'>('monthly');
@@ -10,6 +10,7 @@ export default function UpgradePage() {
   const [paymentError, setPaymentError] = useState('');
   const [userData, setUserData] = useState<any>(null);
   const { data: betaStatus, refetch: refetchBetaStatus } = useBetaStatus();
+  const { refetch: refetchUser } = useCurrentUser();
 
   const [showPayoutSetup, setShowPayoutSetup] = useState(false);
   const [payoutMethod, setPayoutMethod] = useState<'stripe' | 'flutterwave' | null>(null);
@@ -289,9 +290,14 @@ export default function UpgradePage() {
 
   const handlePaymentSuccess = (response: any) => {
     console.log('Payment successful:', response);
+    toast.success(response.message || 'Payment successful!');
     setPaymentSuccess(true);
     setIsProcessing(false);
     setPaymentError('');
+
+    // Refetch user data to update the "Manage Card" tab
+    refetchUser();
+    refetchBetaStatus();
 
     setTimeout(() => {
       window.location.href = '/dashboard';
@@ -308,23 +314,6 @@ export default function UpgradePage() {
     return (
       <div className="min-h-screen bg-gradient-to-br from-orange-50 to-white flex items-center justify-center">
         <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-orange-500"></div>
-      </div>
-    );
-  }
-
-  if (paymentSuccess) {
-    return (
-      <div className="min-h-screen bg-gradient-to-br from-orange-50 to-white flex items-center justify-center px-4">
-        <div className="bg-white rounded-2xl shadow-xl p-8 max-w-md w-full text-center">
-          <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
-            <i className="ri-check-line text-3xl text-green-600"></i>
-          </div>
-          <h2 className="text-2xl font-bold text-gray-900 mb-2">Checkout Successful!</h2>
-          <p className="text-gray-600 mb-6">
-            Congratulations on becoming a part of the Lavoo Community! Redirecting to dashboard...
-          </p>
-          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-orange-500 mx-auto"></div>
-        </div>
       </div>
     );
   }
@@ -730,7 +719,7 @@ export default function UpgradePage() {
             </div>
 
             {/* Active Subscription Banner - TOP LEVEL */}
-            {userData.subscription_status === 'active' && (
+            {userData.subscription_status === 'active' && userData.stripe_payment_method_id && !showCheckout && (
               <div className="max-w-4xl mx-auto mb-10">
                 <div className="bg-gradient-to-r from-orange-500 to-orange-600 rounded-2xl shadow-xl overflow-hidden text-white">
                   <div className="px-8 py-10 flex flex-col md:flex-row items-center justify-between gap-8">
@@ -750,7 +739,7 @@ export default function UpgradePage() {
                             <i className="ri-calendar-event-line text-orange-200"></i>
                             Next Bill: {userData.subscription_expires_at
                               ? new Date(userData.subscription_expires_at).toLocaleDateString('en-US', { day: 'numeric', month: 'long', year: 'numeric' })
-                              : 'Processing...'}
+                              : 'Not Available'}
                           </div>
                           <div className="flex items-center gap-1.5 bg-black/10 px-3 py-1 rounded-full text-sm">
                             <i className="ri-shield-check-line text-orange-200"></i>
@@ -801,8 +790,8 @@ export default function UpgradePage() {
               </div>
             )}
 
-            {/* Pricing Card - Only shown if NOT active or if explicitly upgrading */}
-            {(userData.subscription_status !== 'active' || (showCheckout && selectedPlan === 'yearly')) && (
+            {/* Pricing Card - Only shown if NOT active, if card is missing, or if explicitly upgrading */}
+            {(userData.subscription_status !== 'active' || !userData.stripe_payment_method_id || (showCheckout && selectedPlan === 'yearly')) && (
               <div className="max-w-lg mx-auto">
                 <div className="bg-white rounded-2xl shadow-xl overflow-hidden border-2 border-orange-200">
                   <div className="bg-gradient-to-r from-orange-500 to-orange-600 px-6 py-8 text-white text-center">

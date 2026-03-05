@@ -77,6 +77,14 @@ class User(Base):
     card_saved_at = Column(DateTime(timezone=True), nullable=True)
     subscription_expires_at = Column(DateTime(timezone=True), nullable=True)
 
+    # ADD THESE THREE — without them webhooks can never find or update users
+    stripe_subscription_id = Column(String(255), nullable=True, index=True)
+
+    @property
+    def app_mode(self):
+        from subscriptions.beta_service import BetaService
+        return BetaService.get_app_mode()
+
     # Relationships
     subscriptions = relationship("Subscriptions", back_populates="user")
     tickets = relationship("Ticket", back_populates="user")
@@ -192,6 +200,7 @@ class ShowUser(BaseModel):
 
 class SaveCardRequest(BaseModel):
     payment_method_id: str
+    plan_type: Optional[str] = "monthly" 
 
 
 class UserResponse(BaseModel):
@@ -221,6 +230,9 @@ class UserResponse(BaseModel):
     card_brand: Optional[str] = None
     card_exp_month: Optional[int] = None
     card_exp_year: Optional[int] = None
+    app_mode: Optional[str] = None
+    days_remaining: Optional[int] = None
+    countdown_ends_at: Optional[datetime] = None
 
 
 class AIToolBase(BaseModel):
@@ -339,6 +351,9 @@ class AuthResponse(BaseModel):
     card_brand: str | None = None
     card_exp_month: int | None = None
     card_exp_year: int | None = None
+    app_mode: str | None = None
+    days_remaining: int | None = None
+    countdown_ends_at: datetime | None = None
 
 
 # Paypal payment gateway

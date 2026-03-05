@@ -193,6 +193,7 @@ async def startup_event():
                     ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT 'IT Operations',
                     ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN DEFAULT FALSE,
                     ADD COLUMN IF NOT EXISTS email_notifications BOOLEAN DEFAULT TRUE;
+                    ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(255);
                 """))
 
                 db.execute(text("ALTER TABLE reviews ADD COLUMN IF NOT EXISTS is_attended BOOLEAN DEFAULT FALSE"))
@@ -202,6 +203,14 @@ async def startup_event():
                     ALTER TABLE subscriptions
                     ADD COLUMN IF NOT EXISTS subscription_status VARCHAR(20);
                 """))
+
+                # Create index separately
+                db.execute(text("""
+                    CREATE INDEX IF NOT EXISTS idx_users_stripe_subscription_id 
+                    ON users(stripe_subscription_id) 
+                    WHERE stripe_subscription_id IS NOT NULL;
+                """))
+
 
                 # Initialize subscription_status for existing records
                 # If end_date < now, it's expired. If status is not successful, it's 'Payment failed'.

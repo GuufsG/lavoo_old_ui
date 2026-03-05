@@ -20,6 +20,7 @@ from db.pg_connections import get_db
 from typing import Optional
 from db.pg_models import ShowUser, User, AuthResponse, FailedLoginAttempt, SecurityEvent, IPBlacklist
 from api.utils.sub_utils import sync_user_subscription
+from subscriptions.beta_service import BetaService
 
 bearer_scheme = HTTPBearer()
 router = APIRouter(prefix="", tags=["authenticate"])
@@ -205,6 +206,9 @@ def me(
     # Get token from header or cookie for return
     token = authorization.split()[1] if authorization else access_token_cookie
 
+    # Get Beta Status for countdown
+    status_info = BetaService.get_user_status(current_user)
+
     # Return matched fields
     return {
         "id": current_user.id,
@@ -229,7 +233,10 @@ def me(
         "card_last4": current_user.card_last4,
         "card_brand": current_user.card_brand,
         "card_exp_month": current_user.card_exp_month,
-        "card_exp_year": current_user.card_exp_year
+        "card_exp_year": current_user.card_exp_year,
+        "app_mode": current_user.app_mode,
+        "days_remaining": status_info.get("days_remaining"),
+        "countdown_ends_at": status_info.get("countdown_ends_at")
     }
 
 

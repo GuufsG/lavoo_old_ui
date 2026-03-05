@@ -11,6 +11,7 @@ from db.pg_connections import get_db
 from db.pg_models import User, Referral, Subscriptions, Commission
 
 from api.routes.login import get_current_user
+from subscriptions.beta_service import BetaService
 
 router = APIRouter(prefix="", tags=["earnings"])
 
@@ -46,6 +47,9 @@ async def get_current_user_data(
     db: Session = Depends(get_db)
 ):
     """Get current user's data - OPTIMIZED"""
+    # Get Beta Status for countdown
+    status_info = BetaService.get_user_status(current_user)
+
     # current_user is already the User object from DB
     return {
         "id": current_user.id,
@@ -57,7 +61,16 @@ async def get_current_user_data(
         "referral_code": current_user.referral_code or "",
         "subscription_status": current_user.subscription_status or "inactive",
         "subscription_plan": current_user.subscription_plan or "free",
-        "created_at": current_user.created_at.isoformat() if current_user.created_at else None
+        "stripe_payment_method_id": current_user.stripe_payment_method_id,
+        "created_at": current_user.created_at.isoformat() if current_user.created_at else None,
+        "is_beta_user": current_user.is_beta_user,
+        "card_brand": current_user.card_brand,
+        "card_last4": current_user.card_last4,
+        "card_exp_month": current_user.card_exp_month,
+        "card_exp_year": current_user.card_exp_year,
+        "app_mode": current_user.app_mode or BetaService.get_app_mode(),
+        "days_remaining": status_info.get("days_remaining"),
+        "countdown_ends_at": status_info.get("countdown_ends_at")
     }
         
 

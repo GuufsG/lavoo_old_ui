@@ -53,3 +53,15 @@ To verify the system is ready for live production, follow these two validation p
 In a live environment (Railway, DigitalOcean, etc.):
 *   **APP_MODE**: Managed via the platform's Environment Variable dashboard.
 *   **Cron Job**: The `process_beta_billing.py` should be scheduled to run once every 24 hours. (Note: It is idempotent, meaning it won't charge the same user twice because it checks for `subscription_status != 'active'`).
+
+Testing Subscription Renewal: Stripe handles rebilling automatically. To test it:
+Use Stripe's Test Clocks in the Stripe Dashboard to simulate time advancing. You can attach a test customer to a clock, advance the clock to the end of their billing cycle, and immediately observe if Stripe fires the invoice.payment_succeeded webhooks to your app.
+
+
+Regarding Railway Cron Jobs: Railway handles background scheduling entirely via its UI, not via Linux crontab.
+
+In your Railway project dashboard, click New > Service.
+Select Cron Job.
+Choose your repository.
+Set the Cron Schedule (e.g., 0 0 * * * for daily at midnight).
+In the service settings, set the Start Command to: python cron/process_beta_billing.py (or load your existing Dockerfile.cron-subscriptions image into this Railway Cron service).

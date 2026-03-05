@@ -64,8 +64,8 @@ class CommissionService:
                 db
             )
             
-            db.commit()
-            db.refresh(commission)
+            db.flush()
+            # db.refresh(commission) # We can use flush + already in session
             
             logger.info(
                 f"✅ Commission created: ${commission_amount} for user {referral.referrer_id}"
@@ -145,8 +145,8 @@ class CommissionService:
             summary.pending_commissions -= commission.amount
             # Note: Not moved to paid yet, that happens on actual payout
         
-        db.commit()
-        db.refresh(commission)
+        db.flush()
+        # db.refresh(commission)
         
         logger.info(f"✅ Commission {commission_id} approved")
         return commission
@@ -170,7 +170,7 @@ class CommissionService:
             commission.approved_at = datetime.utcnow()
             count += 1
         
-        db.commit()
+        db.flush()
         
         logger.info(f"✅ Auto-approved {count} commissions")
         return count

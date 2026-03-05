@@ -24,6 +24,9 @@ export interface User {
   card_exp_month?: number;
   card_exp_year?: number;
   card_saved_at?: string;
+  app_mode?: string;
+  days_remaining?: number;
+  countdown_ends_at?: string;
 }
 
 export const useCurrentUser = () => {
@@ -203,5 +206,6 @@ export const useBetaStatus = () => {
     },
     enabled: !!localStorage.getItem("auth_token") || !!localStorage.getItem("access_token"),
     staleTime: 60 * 1000,
+    refetchInterval: 10000, // Refetch every 10 seconds for real-time countdown updates
   });
 };

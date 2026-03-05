@@ -3,8 +3,6 @@ import { Outlet } from "react-router-dom";
 import DashboardSidebar from "./feature/DashboardSidebar";
 import AdminSidebar from "./feature/AdminSidebar";
 import Header from "./feature/Header";
-import BetaStatusBanner from "./feature/BetaStatusBanner";
-
 // Admin dashboard layout
 export function AdminLayout() {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
@@ -28,6 +26,8 @@ export function AdminLayout() {
   );
 }
 
+import SubscriptionGuard from "./SubscriptionGuard";
+
 // User dashboard layout
 export default function DashboardLayout() {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
@@ -47,7 +47,7 @@ export default function DashboardLayout() {
       <div className={`flex-1 overflow-y-auto transition-all duration-300 ${isCollapsed ? 'md:ml-16' : 'md:ml-64'
         } ml-0`}>
         <Header onMobileMenuClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)} />
-        <Outlet />
+        <SubscriptionGuard />
       </div>
     </div>
   );
