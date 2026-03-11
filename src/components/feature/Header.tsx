@@ -81,6 +81,7 @@ export default function Header({ onMobileMenuClick }: HeaderProps) {
 
   const queryClient = useQueryClient();
   const notificationRef = useRef<HTMLDivElement>(null);
+  const prevNotificationsOpen = useRef(false);
 
   const { data: user, isLoading } = useCurrentUser();
   const { data: betaStatus } = useBetaStatus();
@@ -127,25 +128,33 @@ export default function Header({ onMobileMenuClick }: HeaderProps) {
     setIsMobileMenuOpen(false);
   };
 
-  const handleNotificationClick = async () => {
-    // Open/close immediately for better UX
-    const willOpen = !isNotificationsOpen;
-    setIsNotificationsOpen(willOpen);
+  const handleNotificationClick = () => {
+    setIsNotificationsOpen((prev) => !prev);
+  };
 
-    if (willOpen) {
-      // Mark all as read on backend in background
-      try {
-        const token = Cookies.get("access_token") || localStorage.getItem("auth_token") || localStorage.getItem("user_token") || localStorage.getItem("access_token");
-        await axios.post("/api/notifications/read-all", {}, {
-          headers: token ? { Authorization: `Bearer ${token}` } : {}
-        });
-        // Update local state
-        setNotifications(prev => prev.map(n => ({ ...n, read: true })));
-      } catch (err) {
-        console.error("Failed to mark all as read:", err);
+  // Mark all as read when user closes the panel
+  useEffect(() => {
+    // Transition from open (true) to closed (false)
+    if (prevNotificationsOpen.current && !isNotificationsOpen && isLoggedIn) {
+      const hasUnread = notifications.some(n => !n.read);
+      if (hasUnread) {
+        const markAsRead = async () => {
+          try {
+            const token = Cookies.get("access_token") || localStorage.getItem("auth_token") || localStorage.getItem("user_token") || localStorage.getItem("access_token");
+            await axios.post("/api/notifications/read-all", {}, {
+              headers: token ? { Authorization: `Bearer ${token}` } : {}
+            });
+            // Update local in-memory state to clear the badge immediately
+            setNotifications(prev => prev.map(n => ({ ...n, read: true })));
+          } catch (err) {
+            console.error("Failed to mark all as read:", err);
+          }
+        };
+        markAsRead();
       }
     }
-  };
+    prevNotificationsOpen.current = isNotificationsOpen;
+  }, [isNotificationsOpen, isLoggedIn, notifications]);
 
   // Fetch initial notifications
   const fetchNotifications = async () => {
@@ -362,7 +371,10 @@ export default function Header({ onMobileMenuClick }: HeaderProps) {
                                 <div
                                   key={notification.id}
                                   className={`px-4 py-3 hover:bg-gray-50 cursor-pointer transition-colors ${!notification.read ? 'bg-orange-50/30' : ''}`}
-                                  onClick={() => notification.link && navigate(notification.link)}
+                                  onClick={() => {
+                                    setIsNotificationsOpen(false);
+                                    notification.link && navigate(notification.link);
+                                  }}
                                 >
                                   <div className="flex items-start">
                                     <div className="flex-shrink-0 mt-1">

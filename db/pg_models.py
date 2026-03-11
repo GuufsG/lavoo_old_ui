@@ -443,6 +443,11 @@ class ConfirmSubscriptionRequest(BaseModel):
     payment_intent_id: str
 
 
+class PaymentFailedNotifyRequest(BaseModel):
+    subscription_id: str
+    reason: str = "3D Secure authentication failed"
+
+
 class UpdatePaymentMethodRequest(BaseModel):
     payment_method_id: str
 

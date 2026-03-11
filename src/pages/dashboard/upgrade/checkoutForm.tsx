@@ -124,6 +124,25 @@ function CheckoutForm({
     const { error: confirmError, paymentIntent } = await stripe.confirmCardPayment(clientSecret);
 
     if (confirmError) {
+      // Best-effort: tell the backend to create a persistent payment_failed notification
+      // for this user so it shows in the bell even after a page reload.
+      // We do NOT await or surface errors from this call — the user-facing error
+      // message (thrown below) is what matters.
+      try {
+        const failToken = getAuthToken();
+        fetch('/api/stripe/payment-failed-notify', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${failToken}`,
+          },
+          body: JSON.stringify({
+            subscription_id: subscriptionId,
+            reason: confirmError.message || '3D Secure authentication failed',
+          }),
+        }).catch(() => { /* intentionally ignored */ });
+      } catch { /* getAuthToken may throw if not logged in — safe to ignore */ }
+
       // User cancelled, card declined in 3DS, or authentication failed
       throw new Error(confirmError.message || '3D Secure authentication failed');
     }
@@ -192,15 +211,15 @@ function CheckoutForm({
         : '/api/stripe/create-subscription-with-saved-card';
 
       const payload = isBeta
-        ? { 
-            payment_method_id: paymentMethod.id,
-            plan_type: planType,   // required so backend saves the correct plan during beta
-          }
+        ? {
+          payment_method_id: paymentMethod.id,
+          plan_type: planType,   // required so backend saves the correct plan during beta
+        }
         : {
-            payment_method_id: paymentMethod.id,
-            plan_type: planType,
-            billing_details: billingDetails,
-          };
+          payment_method_id: paymentMethod.id,
+          plan_type: planType,
+          billing_details: billingDetails,
+        };
 
       const response = await fetch(endpoint, {
         method: 'POST',
@@ -268,8 +287,8 @@ function CheckoutForm({
   const getProcessingLabel = () => {
     switch (step) {
       case 'authenticating': return 'Authenticating with your bank...';
-      case 'confirming':     return 'Confirming subscription...';
-      default:               return 'Processing...';
+      case 'confirming': return 'Confirming subscription...';
+      default: return 'Processing...';
     }
   };
 

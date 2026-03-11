@@ -83,7 +83,7 @@ export default function ReviewsPage() {
 
   const [userReviews, setUserReviews] = useState<Review[]>(getCachedReviews());
   const [reviewsWithConversations, setReviewsWithConversations] = useState<Review[]>(getCachedConversations());
-  const [totalUnreadMessages, setTotalUnreadMessages] = useState(0);
+  //   const [totalUnreadMessages, setTotalUnreadMessages] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [currentReviewsPage, setCurrentReviewsPage] = useState(1);
@@ -130,7 +130,7 @@ export default function ReviewsPage() {
       if (showLoadingIndicator) {
         setIsLoading(true);
       }
-      const response = await fetch(`${API_BASE_URL}/reviews`, { cache: 'no-store', method: 'GET', headers: getAuthHeaders() });
+      const response = await fetch(`${API_BASE_URL}/api/reviews`, { cache: 'no-store', method: 'GET', headers: getAuthHeaders() });
       if (response.status === 401) {
         showToastMessage('❌ Session expired. Please log in again.');
         setIsAuthenticated(false);
@@ -173,11 +173,11 @@ export default function ReviewsPage() {
   const fetchUnreadCount = async () => {
     if (!isAuthenticated) return;
     try {
-      const response = await fetch(`${API_BASE_URL}/reviews/unread-count`, { method: 'GET', headers: getAuthHeaders() });
+      const response = await fetch(`${API_BASE_URL}/api/reviews/unread-count`, { method: 'GET', headers: getAuthHeaders() });
       if (response.status === 401) { console.warn('Authentication failed for unread count'); return; }
       if (!response.ok) { console.warn('Failed to fetch unread count'); return; }
       const data = await response.json();
-      setTotalUnreadMessages(data.total_unread);
+      // setTotalUnreadMessages(data.total_unread);
       localStorage.setItem('reviewsUnreadCount', data.total_unread.toString());
       window.dispatchEvent(new CustomEvent('reviewsUnreadCountChanged', { detail: { count: data.total_unread } }));
     } catch (error) {
@@ -203,9 +203,9 @@ export default function ReviewsPage() {
   });
 
   const totalReviewsPages = Math.ceil(filteredReviews.length / REVIEWS_PER_PAGE);
-  const totalConversationsPages = Math.ceil(filteredConversations.length / REVIEWS_PER_PAGE);
+  // const totalConversationsPages = Math.ceil(filteredConversations.length / REVIEWS_PER_PAGE);
   const paginatedReviews = filteredReviews.slice((currentReviewsPage - 1) * REVIEWS_PER_PAGE, currentReviewsPage * REVIEWS_PER_PAGE);
-  const paginatedConversations = filteredConversations.slice((currentConversationsPage - 1) * REVIEWS_PER_PAGE, currentConversationsPage * REVIEWS_PER_PAGE);
+  // const paginatedConversations = filteredConversations.slice((currentConversationsPage - 1) * REVIEWS_PER_PAGE, currentConversationsPage * REVIEWS_PER_PAGE);
 
   useEffect(() => { setCurrentReviewsPage(1); }, [searchTerm, filterStatus]);
   useEffect(() => { setCurrentConversationsPage(1); }, [searchTerm]);
@@ -222,7 +222,7 @@ export default function ReviewsPage() {
     }
     setIsSubmitting(true);
     try {
-      const response = await fetch(`${API_BASE_URL}/reviews`, {
+      const response = await fetch(`${API_BASE_URL}/api/reviews`, {
         method: 'POST', headers: getAuthHeaders(),
         body: JSON.stringify({
           business_name: reviewForm.businessName, review_title: reviewForm.reviewTitle,
@@ -270,7 +270,7 @@ export default function ReviewsPage() {
 
   const handleViewConversation = async (reviewId: number) => {
     try {
-      await fetch(`${API_BASE_URL}/conversations/${reviewId}/mark-read`, { method: 'PUT', headers: getAuthHeaders() });
+      await fetch(`${API_BASE_URL}/api/conversations/${reviewId}/mark-read`, { method: 'PUT', headers: getAuthHeaders() });
       fetchReviews(false); // Silently refresh without loading indicator
       fetchUnreadCount();
     } catch (error) {

@@ -192,7 +192,7 @@ async def startup_event():
                     ADD COLUMN IF NOT EXISTS location VARCHAR(100) DEFAULT 'Nigeria',
                     ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT 'IT Operations',
                     ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN DEFAULT FALSE,
-                    ADD COLUMN IF NOT EXISTS email_notifications BOOLEAN DEFAULT TRUE;
+                    ADD COLUMN IF NOT EXISTS email_notifications BOOLEAN DEFAULT TRUE,
                     ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(255);
                 """))
 
